@@ -125,6 +125,34 @@ def item_source_paths(project: dict[str, Any], item_name: str, *, project_key: s
     return out
 
 
+def normalize_item_relpath(rel: str, *, windows: bool = False) -> str:
+    rel_s = rel.strip()
+    if windows:
+        rel_s = rel_s.lstrip("/\\").rstrip("/\\")
+    else:
+        rel_s = rel_s.lstrip("/").rstrip("/")
+    return rel_s
+
+
+def source_path_for(
+    *,
+    source_rootfs: Path,
+    rel: str,
+    item_source_paths: dict[str, str],
+    source_root_override: Path | None = None,
+    windows: bool = False,
+) -> Path:
+    override_rel = normalize_item_relpath(rel, windows=windows)
+    if source_root_override is not None:
+        candidate = source_root_override / override_rel
+        if candidate.exists():
+            return candidate
+    configured = item_source_paths.get(rel)
+    if configured:
+        return Path(configured).resolve()
+    return source_rootfs / override_rel
+
+
 def discover_component_hook(
     *,
     scripts_dirs: Iterable[Path],

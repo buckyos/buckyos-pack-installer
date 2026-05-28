@@ -93,16 +93,13 @@ def _source_path_for(
     item_kind: str,
     source_root_override: Path | None = None,
 ) -> Path:
-    if source_root_override is not None:
-        override_rel = rel.strip().lstrip("/").rstrip("/")
-        candidate = source_root_override / override_rel
-        if candidate.exists():
-            return candidate
     mapping = layout.module_source_paths if item_kind == "module" else layout.data_source_paths
-    configured = mapping.get(rel)
-    if configured:
-        return Path(configured).resolve()
-    return _safe_join(layout.source_rootfs, rel)
+    return common.source_path_for(
+        source_rootfs=layout.source_rootfs,
+        rel=rel,
+        item_source_paths=mapping,
+        source_root_override=source_root_override,
+    )
 
 
 def load_app_layout(
@@ -642,8 +639,7 @@ def _remove_path(path: Path, dry_run: bool) -> None:
 
 def _copy_path(src: Path, dst: Path, overwrite: bool, dry_run: bool) -> None:
     if not src.exists() and not src.is_symlink():
-        print(f"[warn] source missing, skip: {src}")
-        return
+        raise FileNotFoundError(f"declared source path missing: {src}")
     if dry_run:
         mode = "overwrite" if overwrite else "no-overwrite"
         print(f"[dry-run] copy({mode}): {src} -> {dst}")
@@ -673,6 +669,8 @@ def action_update(layout: AppLayout, dry_run: bool = False) -> None:
     for rel in layout.data_paths:
         src = _source_path_for(layout, rel, item_kind="data")
         dst = _safe_join(layout.target_rootfs, rel)
+        if not src.exists():
+            raise FileNotFoundError(f"declared data_paths source missing: {src}")
         if dst.exists() or dst.is_symlink():
             continue
         if _is_dir_path(rel):

@@ -84,6 +84,8 @@ class AppLayout:
     module_paths: List[str]
     data_paths: List[str]
     clean_paths: List[str]
+    module_source_paths: Dict[str, str]
+    data_source_paths: Dict[str, str]
 
 
 def _ignore_copy_entries(_: str, names: List[str]) -> List[str]:
@@ -162,6 +164,8 @@ def load_app_layout(
         module_paths=module_paths,
         data_paths=data_paths,
         clean_paths=clean_paths,
+        module_source_paths={rel: str((source_rootfs / rel.strip().lstrip("/\\")).resolve()) for rel in module_paths},
+        data_source_paths={rel: str((source_rootfs / rel.strip().lstrip("/\\")).resolve()) for rel in data_paths},
     )
 
 
@@ -188,6 +192,8 @@ def load_app_layout_from_manifest(
         module_paths=common.item_paths(app_cfg, "module_items", project_key=app_key),
         data_paths=common.item_paths(app_cfg, "data_items", project_key=app_key),
         clean_paths=common.item_paths(app_cfg, "clean_items", project_key=app_key),
+        module_source_paths=common.item_source_paths(app_cfg, "module_items", project_key=app_key),
+        data_source_paths=common.item_source_paths(app_cfg, "data_items", project_key=app_key),
     )
 
 
@@ -542,7 +548,13 @@ def _stage_buckyos_app_root(*, src_root: Path, dst_root: Path, layout: AppLayout
         if rel_s.startswith("/") or rel_s.startswith("\\"):
             rel_s = rel_s[1:]
         rel_s = rel_s.rstrip("/\\")
-        s = src_root / rel_s
+        s = common.source_path_for(
+            source_rootfs=layout.source_rootfs,
+            rel=rel,
+            item_source_paths=layout.module_source_paths,
+            source_root_override=src_root,
+            windows=True,
+        )
         d = dst_root / rel_s
         if not s.exists():
             raise FileNotFoundError(
@@ -563,7 +575,13 @@ def _stage_buckyos_app_root(*, src_root: Path, dst_root: Path, layout: AppLayout
         if rel_s.startswith("/") or rel_s.startswith("\\"):
             rel_s = rel_s[1:]
         rel_s = rel_s.rstrip("/\\")
-        s = src_root / rel_s
+        s = common.source_path_for(
+            source_rootfs=layout.source_rootfs,
+            rel=rel,
+            item_source_paths=layout.data_source_paths,
+            source_root_override=src_root,
+            windows=True,
+        )
         d = defaults_root / rel_s
         if not s.exists():
             raise FileNotFoundError(

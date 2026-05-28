@@ -87,6 +87,20 @@ class PackageCommonTests(unittest.TestCase):
                 hook,
             )
 
+    def test_source_path_for_prefers_manifest_mapping(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td) / "root"
+            mapped = Path(td) / "merged" / "bin" / "cyfs-gateway"
+            mapped.mkdir(parents=True)
+            self.assertEqual(
+                common.source_path_for(
+                    source_rootfs=root,
+                    rel="bin/cyfs-gateway/",
+                    item_source_paths={"bin/cyfs-gateway/": str(mapped)},
+                ),
+                mapped.resolve(),
+            )
+
 
 if __name__ == "__main__":
     unittest.main()
