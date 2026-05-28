@@ -29,7 +29,7 @@ import tempfile
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Tuple
+from typing import Any, Dict, List, Tuple
 
 import re
 
@@ -418,46 +418,6 @@ def _xml_escape(s: str) -> str:
     )
 
 
-def generate_welcome_html(components: Iterable["PublishComponent"], out_path: Path) -> None:
-    rows = []
-    for c in components:
-        rows.append(
-            "<tr>"
-            f"<td><b>{_xml_escape(c.name)}</b></td>"
-            f"<td><code>{_xml_escape(c.default_target)}</code></td>"
-            f"<td>{'Optional' if c.optional else 'Required'}</td>"
-            "</tr>"
-        )
-
-    html = """<!doctype html>
-<html>
-  <head>
-    <meta charset="utf-8" />
-    <style>
-      body { font-family: -apple-system, system-ui, sans-serif; font-size: 13px; }
-      table { border-collapse: collapse; width: 100%%; }
-      th, td { border: 1px solid #ddd; padding: 8px; vertical-align: top; }
-      th { background: #f6f6f6; text-align: left; }
-      code { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
-    </style>
-  </head>
-  <body>
-    <p>This installer contains multiple components. Install locations are shown below.</p>
-    <p><b>Note:</b> <code>~</code> means the current user's home directory.</p>
-    <table>
-      <thead>
-        <tr><th>Component</th><th>Install location</th><th>Required</th></tr>
-      </thead>
-      <tbody>
-        %s
-      </tbody>
-    </table>
-  </body>
-</html>
-""" % ("\n        ".join(rows))
-    out_path.write_text(html + "\n", encoding="utf-8")
-
-
 def _write_distribution_xml(
     *,
     title: str,
@@ -563,7 +523,6 @@ def build_macos_distribution_pkg(
     manifest_path: Path | None,
     app_publish_dir: Path,
     out_dir: Path,
-    extra_bundles: Optional[List[Path]] = None,
     dry_run: bool = False,
 ) -> Path:
     components = (
@@ -571,25 +530,6 @@ def build_macos_distribution_pkg(
         if manifest_path is not None
         else load_macos_pkg_components(project_yaml_path)
     )
-
-    # Inject extra bundle apps (not defined in bucky_project.yaml).
-    extras: List[PublishComponent] = []
-    for p in (extra_bundles or []):
-        p = p.expanduser().resolve()
-        if p.suffix != ".app":
-            raise ValueError(f"extra bundle must be a .app directory: {p}")
-        extras.append(
-            PublishComponent(
-                key=f"bundle-{p.stem}",
-                name=p.stem,
-                kind="bundle",
-                optional=True,
-                src=str(p),
-                default_target=str(Path("/Applications") / p.name),
-            )
-        )
-
-    components = components + extras
 
     work_dir = TMP_INSTALL_DIR / "distbuild"
     roots_dir = work_dir / "roots"
@@ -674,7 +614,7 @@ def build_macos_distribution_pkg(
         # Attach scripts for any component that provides templates in publish/macos_pkg/scripts/.
         templates_dir = resources_dir / "scripts"
         has_templates = any(
-            (templates_dir / f"{comp.key}_{name}").exists() for name in ("preinstall", "postinstall", "uninstall")
+            (templates_dir / f"{comp.key}_{name}").exists() for name in ("preinstall", "postinstall")
         )
         if has_templates:
             scripts_dir = work_dir / "scripts" / comp.key
@@ -919,7 +859,7 @@ def verify_pkg(
 
             scripts_dir = subpkg_dir / "Scripts"
             expects_scripts = any(
-                (templates_dir / f"{comp.key}_{name}").exists() for name in ("preinstall", "postinstall", "uninstall")
+                (templates_dir / f"{comp.key}_{name}").exists() for name in ("preinstall", "postinstall")
             )
             if expects_scripts and not scripts_dir.exists():
                 failures.append(f"component {comp.key} should have Scripts/ but it is missing")
@@ -1216,12 +1156,6 @@ def _materialize_pkg_scripts_from_templates(component_key: str, templates_dir: P
             continue
         shutil.copy2(src_path, out_scripts_dir / dst_name)
         (out_scripts_dir / dst_name).chmod(0o755)
-    # Also ship the uninstall helper (not auto-executed by Installer).
-    uninstall_tpl = templates_dir / f"{component_key}_uninstall"
-    if uninstall_tpl.exists():
-        shutil.copy2(uninstall_tpl, out_scripts_dir / "uninstall")
-        (out_scripts_dir / "uninstall").chmod(0o755)
-
 
 AUTO_BEGIN = "# BEGIN AUTO-GENERATED:"
 AUTO_END = "# END AUTO-GENERATED:"
@@ -1351,14 +1285,6 @@ def sync_macos_scripts(
             txt = _replace_marked_block(txt, "data_paths", _data_copy_lines(root_var, defaults_var, layout.data_paths), indent="  ")
             post.write_text(txt.rstrip("\n") + "\n", encoding="utf-8")
 
-        un = scripts_dir / f"{app_key}_uninstall"
-        if un.exists():
-            txt = un.read_text(encoding="utf-8", errors="ignore")
-            root_var = _detect_root_var(txt)
-            txt = _replace_marked_block(txt, "modules", _rm_lines(root_var, layout.module_paths))
-            txt = _replace_marked_block(txt, "clean_paths", _rm_lines(root_var, layout.clean_paths))
-            un.write_text(txt.rstrip("\n") + "\n", encoding="utf-8")
-
 
 def build_pkg(architecture: str, version: str, **kwargs: Any) -> None:
     # Kept for backward compatibility with legacy callers.
@@ -1416,15 +1342,9 @@ def main(argv: List[str]) -> int:
         action="store_true",
         help="Do not auto-sync publish/macos_pkg/scripts from bucky_project.yaml before build",
     )
-    p_build.add_argument(
-        "--extra-bundle",
-        action="append",
-        default=[],
-        help="Extra .app bundle path to include as an optional component (repeatable)",
-    )
     p_build.add_argument("--dry-run", action="store_true", help="Print commands without executing them")
 
-    p_sync = sub.add_parser("sync-macos-scripts", help="Regenerate macos_pkg preinstall/postinstall/uninstall from bucky_project.yaml")
+    p_sync = sub.add_parser("sync-macos-scripts", help="Regenerate macos_pkg preinstall/postinstall from bucky_project.yaml")
     p_sync.add_argument("--project", default=str(PROJECT_YAML), help="Path to bucky_project.yaml")
     p_sync.add_argument("--manifest", default=None, help="Path to generated project manifest JSON")
 
@@ -1447,7 +1367,6 @@ def main(argv: List[str]) -> int:
         arch = args.architecture
         if arch == "x86_64":
             arch = "amd64"
-        extra_bundles = [Path(p) for p in (args.extra_bundle or [])]
         if args.no_sync_scripts:
             os.environ["BUCKYOS_PKG_NO_SYNC_SCRIPTS"] = "1"
         out_pkg = build_macos_distribution_pkg(
@@ -1457,7 +1376,6 @@ def main(argv: List[str]) -> int:
             manifest_path=Path(args.manifest).resolve() if args.manifest else None,
             app_publish_dir=Path(args.app_publish_dir),
             out_dir=Path(args.out_dir),
-            extra_bundles=extra_bundles,
             dry_run=bool(args.dry_run),
         )
         print(f"pkg built: {out_pkg}")

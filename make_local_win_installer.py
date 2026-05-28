@@ -268,10 +268,9 @@ def load_win_pkg_components(project_yaml_path: Path) -> List[PublishComponent]:
         default_target = _as_str(cfg.get("default_target", "")).strip()
         if not default_target:
             raise ValueError(f"publish.win_pkg.apps.{key} missing default_target")
-        # Handle 'true,' string (YAML parsing quirk)
         system_service_val = cfg.get("system_service", False)
         if isinstance(system_service_val, str):
-            system_service = system_service_val.lower().strip().rstrip(",") == "true"
+            system_service = system_service_val.lower().strip() == "true"
         else:
             system_service = bool(system_service_val)
         components.append(
@@ -309,7 +308,7 @@ def load_win_pkg_components_from_manifest(manifest_path: Path) -> List[PublishCo
             raise ValueError(f"manifest install project '{key}' missing windows platform config")
         system_service_val = platform_cfg.get("system_service", False)
         if isinstance(system_service_val, str):
-            system_service = system_service_val.lower().strip().rstrip(",") == "true"
+            system_service = system_service_val.lower().strip() == "true"
         else:
             system_service = bool(system_service_val)
         components.append(
@@ -1133,8 +1132,8 @@ def build_win_installer(
     payload_dir = work_dir / "payload"
     nsi_file = work_dir / "installer.nsi"
     
-    # Keep scripts in sync with bucky_project.yaml before building
-    if not dry_run and not bool(os.environ.get("BUCKYOS_PKG_NO_SYNC_SCRIPTS")):
+    # Keep scripts in sync with bucky_project.yaml before building.
+    if not dry_run:
         sync_win_scripts(project_yaml_path, WIN_PKG_PROJECT_DIR / "scripts", manifest_path=manifest_path)
     
     if work_dir.exists() and not dry_run:
@@ -1595,11 +1594,6 @@ def main(argv: List[str]) -> int:
         default=str(Path.cwd() / "publish"),
         help='Output directory for the final .exe (default: "./publish")'
     )
-    p_build.add_argument(
-        "--no-sync-scripts",
-        action="store_true",
-        help="Do not auto-sync win_pkg/scripts from bucky_project.yaml before build"
-    )
     p_build.add_argument("--dry-run", action="store_true", help="Preview build without executing NSIS")
     
     # verify command
@@ -1619,8 +1613,6 @@ def main(argv: List[str]) -> int:
         arch = args.architecture
         if arch == "x86_64":
             arch = "amd64"
-        if args.no_sync_scripts:
-            os.environ["BUCKYOS_PKG_NO_SYNC_SCRIPTS"] = "1"
         
         out_exe = build_win_installer(
             architecture=arch,
