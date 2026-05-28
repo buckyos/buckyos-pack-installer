@@ -15,6 +15,10 @@ if [ -d "$DEFAULTS_DIR" ]; then
   # END AUTO-GENERATED: data_paths
 fi
 
+# BEGIN AUTO-GENERATED: component_postinstall_hooks
+
+# END AUTO-GENERATED: component_postinstall_hooks
+
 # Keep package content at package-defined permissions; only mutable runtime roots
 # need wide write access for host services and containerized agents.
 ensure_mutable_dir "$BUCKYOS_ROOT/data"

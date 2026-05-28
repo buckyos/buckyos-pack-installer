@@ -1159,6 +1159,8 @@ def _materialize_pkg_scripts_from_templates(component_key: str, templates_dir: P
     for dst_name, src_path in mapping.items():
         if not src_path.exists():
             continue
+        if not src_path.is_file():
+            raise ValueError(f"macOS hook must be a regular file: {src_path}")
         shutil.copy2(src_path, out_scripts_dir / dst_name)
         (out_scripts_dir / dst_name).chmod(0o755)
 

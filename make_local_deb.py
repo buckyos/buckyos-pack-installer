@@ -39,6 +39,7 @@ RESULT_ROOT_DIR = Path(os.environ.get("BUCKYOS_BUILD_ROOT", "/opt/buckyosci"))
 TMP_INSTALL_DIR = RESULT_ROOT_DIR / "deb-build"
 
 DEB_TEMPLATE_DIR = Path(__file__).resolve().parent / "deb_template"
+LINUX_DEB_SCRIPTS_DIR = Path(__file__).resolve().parent / "linux_deb" / "scripts"
 BUCKYOS_DEFAULTS_SUBDIR = ".buckyos_installer_defaults"
 IGNORED_STAGE_NAMES = {".DS_Store", "__pycache__"}
 
@@ -386,6 +387,66 @@ def _replace_marked_block(text: str, block_name: str, new_lines: List[str], inde
     return "\n".join(replaced).rstrip("\n") + "\n"
 
 
+def _linux_component_keys(project_yaml_path: Path, manifest_path: Path | None) -> List[str]:
+    if manifest_path is not None:
+        data = json_load_file(manifest_path)
+        platforms = data.get("platforms", {}) or {}
+        linux_cfg = platforms.get("linux", {}) or {}
+        component_keys = linux_cfg.get("component_keys", []) or []
+        if not isinstance(component_keys, list):
+            raise ValueError("manifest.platforms.linux.component_keys must be a list")
+        return [str(key) for key in component_keys]
+
+    data = yaml_load_file(project_yaml_path)
+    publish = data.get("publish", {}) or {}
+    linux_pkg = (publish.get("linux_pkg", {}) or {}) if isinstance(publish, dict) else {}
+    apps = (linux_pkg.get("apps", {}) or {}) if isinstance(linux_pkg, dict) else {}
+    if isinstance(apps, dict) and apps:
+        return [str(key) for key in apps.keys()]
+    return ["buckyos"]
+
+
+def _discover_linux_hook(component_key: str, step: str) -> Path | None:
+    candidates: List[Path] = []
+    for scripts_dir in (LINUX_DEB_SCRIPTS_DIR, DEB_TEMPLATE_DIR / "DEBIAN"):
+        candidates.extend(
+            [
+                scripts_dir / f"{component_key}_{step}",
+                scripts_dir / f"{component_key}_{step}.sh",
+            ]
+        )
+    for candidate in candidates:
+        if candidate.exists():
+            if not candidate.is_file():
+                raise ValueError(f"Linux hook must be a regular file: {candidate}")
+            return candidate
+    return None
+
+
+def _shell_hook_lines(component_keys: List[str], step: str) -> List[str]:
+    out: List[str] = []
+    for component_key in component_keys:
+        hook_path = _discover_linux_hook(component_key, step)
+        if hook_path is None:
+            continue
+        hook_text = hook_path.read_text(encoding="utf-8")
+        out.extend(
+            [
+                f'echo "[buckyos] running {component_key}_{step} hook"',
+                f"# BEGIN COMPONENT HOOK: {component_key}_{step} ({hook_path})",
+                "(",
+            ]
+        )
+        out.extend(hook_text.rstrip("\n").splitlines())
+        out.extend(
+            [
+                ")",
+                f"# END COMPONENT HOOK: {component_key}_{step}",
+            ]
+        )
+    return out or [":"]
+
+
 def sync_deb_scripts(
     project_yaml_path: Path,
     scripts_dir: Path,
@@ -405,10 +466,16 @@ def sync_deb_scripts(
         project_yaml_path=project_yaml_path,
         manifest_path=manifest_path,
     )
+    component_keys = _linux_component_keys(project_yaml_path, manifest_path)
 
     preinst = scripts_dir / "preinst"
     if preinst.exists():
         txt = preinst.read_text(encoding="utf-8", errors="ignore")
+        txt = _replace_marked_block(
+            txt,
+            "component_preinstall_hooks",
+            _shell_hook_lines(component_keys, "preinstall"),
+        )
         txt = _replace_marked_block(txt, "modules", _rm_lines("$BUCKYOS_ROOT", layout.module_paths))
         preinst.write_text(txt.rstrip("\n") + "\n", encoding="utf-8")
 
@@ -420,6 +487,11 @@ def sync_deb_scripts(
             "data_paths",
             _data_copy_lines("$BUCKYOS_ROOT", "$DEFAULTS_DIR", layout.data_paths),
             indent="  ",
+        )
+        txt = _replace_marked_block(
+            txt,
+            "component_postinstall_hooks",
+            _shell_hook_lines(component_keys, "postinstall"),
         )
         postinst.write_text(txt.rstrip("\n") + "\n", encoding="utf-8")
 

@@ -43,6 +43,8 @@ TMP_INSTALL_DIR = RESULT_ROOT_DIR / "win-installer"
 WIN_PKG_PROJECT_DIR = SRC_DIR / "publish" / "win_pkg"
 BUCKYOS_DEFAULTS_SUBDIR = ".buckyos_installer_defaults"
 IGNORED_STAGE_NAMES = {".DS_Store", "__pycache__"}
+WINDOWS_HOOK_EXTENSIONS = (".ps1", ".bat", ".cmd")
+WINDOWS_HOOK_STEPS = ("preinstall", "postinstall")
 
 
 def yaml_load_file(path: Path) -> Dict[str, Any]:
@@ -415,6 +417,78 @@ def _copy_dir_contents(src_dir: Path, dst_dir: Path) -> None:
         else:
             dst.parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(child, dst)
+
+
+def _discover_windows_hook(component_key: str, step: str) -> Path | None:
+    scripts_dir = WIN_PKG_PROJECT_DIR / "scripts"
+    for extension in WINDOWS_HOOK_EXTENSIONS:
+        candidate = scripts_dir / f"{component_key}_{step}{extension}"
+        if candidate.exists():
+            if not candidate.is_file():
+                raise ValueError(f"Windows hook must be a regular file: {candidate}")
+            return candidate
+    return None
+
+
+def _stage_windows_hooks(component_key: str, comp_payload: Path) -> None:
+    hooks_dir = comp_payload / "scripts" / "hooks"
+    for step in WINDOWS_HOOK_STEPS:
+        hook_path = _discover_windows_hook(component_key, step)
+        if hook_path is None:
+            continue
+        hooks_dir.mkdir(parents=True, exist_ok=True)
+        dst = hooks_dir / f"{step}{hook_path.suffix.lower()}"
+        shutil.copy2(hook_path, dst)
+
+
+def _windows_payload_hook(comp_payload: Path, step: str) -> Path | None:
+    hooks_dir = comp_payload / "scripts" / "hooks"
+    for extension in WINDOWS_HOOK_EXTENSIONS:
+        candidate = hooks_dir / f"{step}{extension}"
+        if candidate.exists():
+            return candidate
+    return None
+
+
+def _hook_exec_command(var_name: str, hook_rel: str) -> str:
+    hook_path = f"${var_name}\\{hook_rel}"
+    suffix = Path(hook_rel).suffix.lower()
+    if suffix == ".ps1":
+        return f'powershell.exe -NoProfile -ExecutionPolicy Bypass -File "{hook_path}"'
+    if suffix in (".bat", ".cmd"):
+        return f'cmd.exe /c ""{hook_path}""'
+    raise ValueError(f"unsupported Windows hook extension: {hook_rel}")
+
+
+def _append_windows_hook_call(
+    lines: List[str],
+    *,
+    comp_key: str,
+    var_name: str,
+    hook_rel: str,
+    step: str,
+) -> None:
+    error_code = "50" if step == "preinstall" else "70"
+    label = f"{_sanitize_id(comp_key).replace('-', '_')}_{step}"
+    hook_cmd = _hook_exec_command(var_name, hook_rel)
+    lines.append(f"  ; Run {comp_key} {step} hook")
+    lines.append(f"  nsExec::ExecToLog '{hook_cmd}'")
+    lines.append("  Pop $0")
+    lines.append("  ${If} $0 != 0")
+    lines.append(f"    IfSilent silent_hook_failed_{label} interactive_hook_failed_{label}")
+    lines.append(f"silent_hook_failed_{label}:")
+    lines.append('    FileOpen $1 "$InstallerLogPath" a')
+    lines.append(f'    FileWrite $1 "{comp_key} {step} hook failed with exit code $0.$\\r$\\n"')
+    lines.append("    FileClose $1")
+    lines.append(f"    SetErrorLevel {error_code}")
+    lines.append("    Abort")
+    lines.append(f"interactive_hook_failed_{label}:")
+    lines.append(
+        f'    MessageBox MB_OK|MB_ICONSTOP "{comp_key} {step} hook failed with exit code $0."'
+    )
+    lines.append(f"    SetErrorLevel {error_code}")
+    lines.append("    Abort")
+    lines.append("  ${EndIf}")
 
 
 def _iter_payload_file_basenames(root: Path, *, limit: int = 256) -> List[str]:
@@ -1050,6 +1124,15 @@ def generate_nsis_script(
                 lines.append('    MessageBox MB_RETRYCANCEL|MB_ICONSTOP "Required port $PortCheckPort cannot be bound.$\\r$\\nPlease free ports 3180, 80, and 443 before installing." IDRETRY port_check_' + dep_label)
                 lines.append("    Abort")
                 lines.append("  ${EndIf}")
+            pre_hook = _windows_payload_hook(comp_payload, "preinstall")
+            if pre_hook is not None:
+                _append_windows_hook_call(
+                    lines,
+                    comp_key=comp.key,
+                    var_name=var_name,
+                    hook_rel=pre_hook.relative_to(comp_payload).as_posix().replace("/", "\\"),
+                    step="preinstall",
+                )
             lines.append(f'  SetOutPath "${var_name}"')
             lines.append(f'  File /r "{comp_payload}\\*.*"')
         
@@ -1112,6 +1195,15 @@ def generate_nsis_script(
             lines.append(f'    WriteRegExpandStr HKCU "Environment" "Path" "$0;${var_name}"')
             lines.append("  ${EndIf}")
             lines.append('  SendMessage ${HWND_BROADCAST} ${WM_WININICHANGE} 0 "STR:Environment" /TIMEOUT=5000')
+        post_hook = _windows_payload_hook(comp_payload, "postinstall")
+        if post_hook is not None:
+            _append_windows_hook_call(
+                lines,
+                comp_key=comp.key,
+                var_name=var_name,
+                hook_rel=post_hook.relative_to(comp_payload).as_posix().replace("/", "\\"),
+                step="postinstall",
+            )
         
         # Save each component's install directory to registry for uninstall
         lines.append(f'  WriteRegStr HKCU "Software\\BuckyOS" "InstDir_{comp.key}" "${var_name}"')
@@ -1308,6 +1400,7 @@ def build_win_installer(
         
         comp_payload = payload_dir / comp.key
         comp_payload.mkdir(parents=True, exist_ok=True)
+        _stage_windows_hooks(comp.key, comp_payload)
         
         if comp.kind == "app":
             layout = resolve_app_layout(
