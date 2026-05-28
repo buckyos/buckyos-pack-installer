@@ -28,6 +28,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List
 
+import package_common as common
+
 try:
     import yaml  # type: ignore
 except ImportError:  # pragma: no cover
@@ -48,24 +50,11 @@ WINDOWS_HOOK_STEPS = ("preinstall", "postinstall")
 
 
 def yaml_load_file(path: Path) -> Dict[str, Any]:
-    if yaml is None:
-        raise ImportError(
-            "PyYAML is required to read bucky_project.yaml. "
-            "Use your project venv or install via `pip install pyyaml`."
-        )
-    data = yaml.safe_load(path.read_text(encoding="utf-8"))
-    if data is None:
-        return {}
-    if not isinstance(data, dict):
-        raise ValueError(f"YAML root must be a map: {path}")
-    return data
+    return common.yaml_load_file(path)
 
 
 def json_load_file(path: Path) -> Dict[str, Any]:
-    data = json.loads(path.read_text(encoding="utf-8"))
-    if not isinstance(data, dict):
-        raise ValueError(f"JSON root must be a map: {path}")
-    return data
+    return common.json_load_file(path)
 
 
 def _expand_vars(s: str) -> str:
@@ -85,14 +74,7 @@ def _expand_vars(s: str) -> str:
 
 
 def _manifest_install_project(manifest_path: Path, project_key: str) -> Dict[str, Any]:
-    data = json_load_file(manifest_path)
-    install_projects = data.get("install_projects", {}) or {}
-    if not isinstance(install_projects, dict):
-        raise ValueError("manifest.install_projects must be a map")
-    project = install_projects.get(project_key)
-    if not isinstance(project, dict):
-        raise ValueError(f"manifest.install_projects.{project_key} missing or invalid")
-    return project
+    return common.manifest_install_project(manifest_path, project_key)
 
 
 @dataclass(frozen=True)
@@ -200,22 +182,12 @@ def load_app_layout_from_manifest(
     )
     target_str = target_override if target_override else default_target
 
-    def item_paths(name: str) -> List[str]:
-        items = app_cfg.get(name, []) or []
-        if not isinstance(items, list):
-            raise ValueError(f"manifest install project '{app_key}'.{name} must be a list")
-        return [
-            str(item.get("raw_path") or item.get("target_dir_name") or "")
-            for item in items
-            if isinstance(item, dict) and str(item.get("raw_path") or item.get("target_dir_name") or "").strip()
-        ]
-
     return AppLayout(
         source_rootfs=Path(source_rootfs_raw).resolve(),
         target_rootfs=Path(_expand_vars(target_str)).resolve(),
-        module_paths=item_paths("module_items"),
-        data_paths=item_paths("data_items"),
-        clean_paths=item_paths("clean_items"),
+        module_paths=common.item_paths(app_cfg, "module_items", project_key=app_key),
+        data_paths=common.item_paths(app_cfg, "data_items", project_key=app_key),
+        clean_paths=common.item_paths(app_cfg, "clean_items", project_key=app_key),
     )
 
 
@@ -242,24 +214,11 @@ def _as_str(v: Any) -> str:
 
 
 def _parse_bool(value: Any, *, field_name: str, default: bool = False) -> bool:
-    if value is None:
-        return default
-    if isinstance(value, bool):
-        return value
-    if isinstance(value, str):
-        normalized = value.strip().lower()
-        if normalized in ("true", "yes", "1", "on"):
-            return True
-        if normalized in ("false", "no", "0", "off"):
-            return False
-    raise ValueError(f"{field_name} must be a boolean value")
+    return common.parse_bool(value, field_name=field_name, default=default)
 
 
 def _parse_component_type(value: Any, *, field_name: str) -> str:
-    kind = _as_str(value or "app").strip()
-    if kind not in ("app", "bundle"):
-        raise ValueError(f"{field_name} must be one of: app, bundle")
-    return kind
+    return common.parse_component_type(value, field_name=field_name)
 
 
 def _sanitize_id(s: str) -> str:
@@ -330,13 +289,9 @@ def load_win_pkg_components(project_yaml_path: Path) -> List[PublishComponent]:
 def load_win_pkg_components_from_manifest(manifest_path: Path) -> List[PublishComponent]:
     data = json_load_file(manifest_path)
     install_projects = data.get("install_projects", {}) or {}
-    platforms = data.get("platforms", {}) or {}
-    win_cfg = platforms.get("windows", {}) or {}
-    component_keys = win_cfg.get("component_keys", []) or []
+    component_keys = common.manifest_component_keys(manifest_path, "windows")
     if not isinstance(install_projects, dict):
         raise ValueError("manifest.install_projects must be a map")
-    if not isinstance(component_keys, list):
-        raise ValueError("manifest.platforms.windows.component_keys must be a list")
 
     components: List[PublishComponent] = []
     for key in component_keys:
@@ -420,14 +375,12 @@ def _copy_dir_contents(src_dir: Path, dst_dir: Path) -> None:
 
 
 def _discover_windows_hook(component_key: str, step: str) -> Path | None:
-    scripts_dir = WIN_PKG_PROJECT_DIR / "scripts"
-    for extension in WINDOWS_HOOK_EXTENSIONS:
-        candidate = scripts_dir / f"{component_key}_{step}{extension}"
-        if candidate.exists():
-            if not candidate.is_file():
-                raise ValueError(f"Windows hook must be a regular file: {candidate}")
-            return candidate
-    return None
+    return common.discover_component_hook(
+        scripts_dirs=(WIN_PKG_PROJECT_DIR / "scripts",),
+        component_key=component_key,
+        step=step,
+        extensions=WINDOWS_HOOK_EXTENSIONS,
+    )
 
 
 def _stage_windows_hooks(component_key: str, comp_payload: Path) -> None:
@@ -704,7 +657,9 @@ def generate_nsis_script(
     
     # Installer attributes
     lines.append(f'Name "${{PRODUCT_NAME}} ${{PRODUCT_VERSION}}"')
-    lines.append(f'OutFile "buckyos-windows-{architecture}-{version}.exe"')
+    lines.append(
+        f'OutFile "{common.package_filename(platform_key="windows", architecture=architecture, version=version, package_format="exe")}"'
+    )
     
     # Set default install directory based on architecture
     if nsis_arch == "x64":
@@ -1424,8 +1379,14 @@ def build_win_installer(
 
     if dry_run:
         print(f"\n[dry-run] Would generate NSIS script: {nsi_file}")
-        print(f"[dry-run] Would compile installer to: {out_dir / f'buckyos-windows-{architecture}-{version}.exe'}")
-        return out_dir / f"buckyos-windows-{architecture}-{version}.exe"
+        out_name = common.package_filename(
+            platform_key="windows",
+            architecture=architecture,
+            version=version,
+            package_format="exe",
+        )
+        print(f"[dry-run] Would compile installer to: {out_dir / out_name}")
+        return out_dir / out_name
     
     # Generate NSIS script
     license_file = WIN_PKG_PROJECT_DIR / "license.txt"
@@ -1481,8 +1442,14 @@ def build_win_installer(
         raise RuntimeError(f"NSIS compilation failed with code {rc}")
     
     # Move output to target directory
-    built_exe = work_dir / f"buckyos-windows-{architecture}-{version}.exe"
-    out_exe = out_dir / f"buckyos-windows-{architecture}-{version}.exe"
+    out_name = common.package_filename(
+        platform_key="windows",
+        architecture=architecture,
+        version=version,
+        package_format="exe",
+    )
+    built_exe = work_dir / out_name
+    out_exe = out_dir / out_name
     
     if built_exe.exists():
         shutil.move(str(built_exe), str(out_exe))

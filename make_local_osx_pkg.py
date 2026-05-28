@@ -32,6 +32,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Tuple
 
 import re
+import package_common as common
 
 try:
     import yaml  # type: ignore
@@ -51,25 +52,11 @@ IGNORED_STAGE_NAMES = {".DS_Store", "__pycache__"}
 
 
 def yaml_load_file(path: Path) -> Dict[str, Any]:
-    if yaml is None:
-        raise ImportError(
-            "PyYAML is required to read bucky_project.yaml. "
-            "Use your project venv (e.g. `./venv/bin/python ...`), "
-            "or install buckyos-devkit (recommended) / `pip install pyyaml`."
-        )
-    data = yaml.safe_load(path.read_text(encoding="utf-8"))
-    if data is None:
-        return {}
-    if not isinstance(data, dict):
-        raise ValueError(f"YAML root must be a map: {path}")
-    return data
+    return common.yaml_load_file(path)
 
 
 def json_load_file(path: Path) -> Dict[str, Any]:
-    data = json.loads(path.read_text(encoding="utf-8"))
-    if not isinstance(data, dict):
-        raise ValueError(f"JSON root must be a map: {path}")
-    return data
+    return common.json_load_file(path)
 
 
 def _expand_vars(s: str) -> str:
@@ -82,14 +69,7 @@ def _expand_vars(s: str) -> str:
 
 
 def _manifest_install_project(manifest_path: Path, project_key: str) -> Dict[str, Any]:
-    data = json_load_file(manifest_path)
-    install_projects = data.get("install_projects", {}) or {}
-    if not isinstance(install_projects, dict):
-        raise ValueError("manifest.install_projects must be a map")
-    project = install_projects.get(project_key)
-    if not isinstance(project, dict):
-        raise ValueError(f"manifest.install_projects.{project_key} missing or invalid")
-    return project
+    return common.manifest_install_project(manifest_path, project_key)
 
 
 @dataclass(frozen=True)
@@ -194,38 +174,14 @@ def load_app_layout_from_manifest(
     )
     target_str = target_override if target_override else default_target
 
-    def item_paths(name: str) -> List[str]:
-        items = app_cfg.get(name, []) or []
-        if not isinstance(items, list):
-            raise ValueError(f"manifest install project '{app_key}'.{name} must be a list")
-        return [
-            str(item.get("raw_path") or item.get("target_dir_name") or "")
-            for item in items
-            if isinstance(item, dict) and str(item.get("raw_path") or item.get("target_dir_name") or "").strip()
-        ]
-
-    def item_source_paths(name: str) -> Dict[str, str]:
-        items = app_cfg.get(name, []) or []
-        if not isinstance(items, list):
-            raise ValueError(f"manifest install project '{app_key}'.{name} must be a list")
-        out: Dict[str, str] = {}
-        for item in items:
-            if not isinstance(item, dict):
-                continue
-            rel = str(item.get("raw_path") or item.get("target_dir_name") or "").strip()
-            source_path = str(item.get("source_path") or "").strip()
-            if rel and source_path:
-                out[rel] = source_path
-        return out
-
     return AppLayout(
         source_rootfs=Path(source_rootfs_raw).resolve(),
         target_rootfs=Path(_expand_vars(target_str)).resolve(),
-        module_paths=item_paths("module_items"),
-        data_paths=item_paths("data_items"),
-        clean_paths=item_paths("clean_items"),
-        module_source_paths=item_source_paths("module_items"),
-        data_source_paths=item_source_paths("data_items"),
+        module_paths=common.item_paths(app_cfg, "module_items", project_key=app_key),
+        data_paths=common.item_paths(app_cfg, "data_items", project_key=app_key),
+        clean_paths=common.item_paths(app_cfg, "clean_items", project_key=app_key),
+        module_source_paths=common.item_source_paths(app_cfg, "module_items", project_key=app_key),
+        data_source_paths=common.item_source_paths(app_cfg, "data_items", project_key=app_key),
     )
 
 
@@ -253,24 +209,11 @@ def _as_str(v: Any) -> str:
 
 
 def _parse_bool(value: Any, *, field_name: str, default: bool = False) -> bool:
-    if value is None:
-        return default
-    if isinstance(value, bool):
-        return value
-    if isinstance(value, str):
-        normalized = value.strip().lower()
-        if normalized in ("true", "yes", "1", "on"):
-            return True
-        if normalized in ("false", "no", "0", "off"):
-            return False
-    raise ValueError(f"{field_name} must be a boolean value")
+    return common.parse_bool(value, field_name=field_name, default=default)
 
 
 def _parse_component_type(value: Any, *, field_name: str) -> str:
-    kind = _as_str(value or "app").strip()
-    if kind not in ("app", "bundle"):
-        raise ValueError(f"{field_name} must be one of: app, bundle")
-    return kind
+    return common.parse_component_type(value, field_name=field_name)
 
 
 def _sanitize_id(s: str) -> str:
@@ -335,13 +278,9 @@ def load_macos_pkg_components(project_yaml_path: Path) -> List[PublishComponent]
 def load_macos_pkg_components_from_manifest(manifest_path: Path) -> List[PublishComponent]:
     data = json_load_file(manifest_path)
     install_projects = data.get("install_projects", {}) or {}
-    platforms = data.get("platforms", {}) or {}
-    macos_cfg = platforms.get("macos", {}) or {}
-    component_keys = macos_cfg.get("component_keys", []) or []
+    component_keys = common.manifest_component_keys(manifest_path, "macos")
     if not isinstance(install_projects, dict):
         raise ValueError("manifest.install_projects must be a map")
-    if not isinstance(component_keys, list):
-        raise ValueError("manifest.platforms.macos.component_keys must be a list")
 
     components: List[PublishComponent] = []
     for key in component_keys:
@@ -661,7 +600,12 @@ def build_macos_distribution_pkg(
 
     if not dry_run:
         out_dir.mkdir(parents=True, exist_ok=True)
-    out_pkg = out_dir / f"buckyos-macos-{architecture}-{version}.pkg"
+    out_pkg = out_dir / common.package_filename(
+        platform_key="macos",
+        architecture=architecture,
+        version=version,
+        package_format="pkg",
+    )
 
     product_cmd = [
         "productbuild",

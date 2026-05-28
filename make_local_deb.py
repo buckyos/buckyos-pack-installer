@@ -26,6 +26,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List
 
+import package_common as common
+
 try:
     import yaml  # type: ignore
 except ImportError:  # pragma: no cover
@@ -45,25 +47,11 @@ IGNORED_STAGE_NAMES = {".DS_Store", "__pycache__"}
 
 
 def yaml_load_file(path: Path) -> Dict[str, Any]:
-    if yaml is None:
-        raise ImportError(
-            "PyYAML is required to read bucky_project.yaml. "
-            "Use your project venv (e.g. `./venv/bin/python ...`), "
-            "or install buckyos-devkit (recommended) / `pip install pyyaml`."
-        )
-    data = yaml.safe_load(path.read_text(encoding="utf-8"))
-    if data is None:
-        return {}
-    if not isinstance(data, dict):
-        raise ValueError(f"YAML root must be a map: {path}")
-    return data
+    return common.yaml_load_file(path)
 
 
 def json_load_file(path: Path) -> Dict[str, Any]:
-    data = json.loads(path.read_text(encoding="utf-8"))
-    if not isinstance(data, dict):
-        raise ValueError(f"JSON root must be a map: {path}")
-    return data
+    return common.json_load_file(path)
 
 
 def _expand_vars(s: str) -> str:
@@ -76,14 +64,7 @@ def _expand_vars(s: str) -> str:
 
 
 def _manifest_install_project(manifest_path: Path, app_key: str) -> Dict[str, Any]:
-    data = json_load_file(manifest_path)
-    install_projects = data.get("install_projects", {}) or {}
-    if not isinstance(install_projects, dict):
-        raise ValueError("manifest.install_projects must be a map")
-    project = install_projects.get(app_key)
-    if not isinstance(project, dict):
-        raise ValueError(f"manifest.install_projects.{app_key} missing or invalid")
-    return project
+    return common.manifest_install_project(manifest_path, app_key)
 
 
 @dataclass(frozen=True)
@@ -188,38 +169,14 @@ def load_app_layout_from_manifest(
     )
     target_str = target_override if target_override else default_target
 
-    def item_paths(name: str) -> List[str]:
-        items = app_cfg.get(name, []) or []
-        if not isinstance(items, list):
-            raise ValueError(f"manifest install project '{app_key}'.{name} must be a list")
-        return [
-            str(item.get("raw_path") or item.get("target_dir_name") or "")
-            for item in items
-            if isinstance(item, dict) and str(item.get("raw_path") or item.get("target_dir_name") or "").strip()
-        ]
-
-    def item_source_paths(name: str) -> Dict[str, str]:
-        items = app_cfg.get(name, []) or []
-        if not isinstance(items, list):
-            raise ValueError(f"manifest install project '{app_key}'.{name} must be a list")
-        out: Dict[str, str] = {}
-        for item in items:
-            if not isinstance(item, dict):
-                continue
-            rel = str(item.get("raw_path") or item.get("target_dir_name") or "").strip()
-            source_path = str(item.get("source_path") or "").strip()
-            if rel and source_path:
-                out[rel] = source_path
-        return out
-
     return AppLayout(
         source_rootfs=Path(source_rootfs_raw).resolve(),
         target_rootfs=Path(_expand_vars(target_str)).resolve(),
-        module_paths=item_paths("module_items"),
-        data_paths=item_paths("data_items"),
-        clean_paths=item_paths("clean_items"),
-        module_source_paths=item_source_paths("module_items"),
-        data_source_paths=item_source_paths("data_items"),
+        module_paths=common.item_paths(app_cfg, "module_items", project_key=app_key),
+        data_paths=common.item_paths(app_cfg, "data_items", project_key=app_key),
+        clean_paths=common.item_paths(app_cfg, "clean_items", project_key=app_key),
+        module_source_paths=common.item_source_paths(app_cfg, "module_items", project_key=app_key),
+        data_source_paths=common.item_source_paths(app_cfg, "data_items", project_key=app_key),
     )
 
 
@@ -315,11 +272,7 @@ def _run(cmd: List[str], dry_run: bool, cwd: Path | None = None) -> None:
 
 
 def _normalize_deb_arch(arch: str) -> str:
-    if arch == "x86_64":
-        return "amd64"
-    if arch == "aarch64":
-        return "arm64"
-    return arch
+    return common.canonical_arch(arch)
 
 
 def _adjust_control_file(dest_dir: Path, new_version: str, architecture: str) -> None:
@@ -389,13 +342,7 @@ def _replace_marked_block(text: str, block_name: str, new_lines: List[str], inde
 
 def _linux_component_keys(project_yaml_path: Path, manifest_path: Path | None) -> List[str]:
     if manifest_path is not None:
-        data = json_load_file(manifest_path)
-        platforms = data.get("platforms", {}) or {}
-        linux_cfg = platforms.get("linux", {}) or {}
-        component_keys = linux_cfg.get("component_keys", []) or []
-        if not isinstance(component_keys, list):
-            raise ValueError("manifest.platforms.linux.component_keys must be a list")
-        return [str(key) for key in component_keys]
+        return common.manifest_component_keys(manifest_path, "linux")
 
     data = yaml_load_file(project_yaml_path)
     publish = data.get("publish", {}) or {}
@@ -407,20 +354,12 @@ def _linux_component_keys(project_yaml_path: Path, manifest_path: Path | None) -
 
 
 def _discover_linux_hook(component_key: str, step: str) -> Path | None:
-    candidates: List[Path] = []
-    for scripts_dir in (LINUX_DEB_SCRIPTS_DIR, DEB_TEMPLATE_DIR / "DEBIAN"):
-        candidates.extend(
-            [
-                scripts_dir / f"{component_key}_{step}",
-                scripts_dir / f"{component_key}_{step}.sh",
-            ]
-        )
-    for candidate in candidates:
-        if candidate.exists():
-            if not candidate.is_file():
-                raise ValueError(f"Linux hook must be a regular file: {candidate}")
-            return candidate
-    return None
+    return common.discover_component_hook(
+        scripts_dirs=(LINUX_DEB_SCRIPTS_DIR, DEB_TEMPLATE_DIR / "DEBIAN"),
+        component_key=component_key,
+        step=step,
+        extensions=("", ".sh"),
+    )
 
 
 def _shell_hook_lines(component_keys: List[str], step: str) -> List[str]:
@@ -584,7 +523,12 @@ def build_deb(
                 script_path.chmod(0o755)
 
     out_dir.mkdir(parents=True, exist_ok=True)
-    out_deb = out_dir / f"buckyos-linux-{deb_arch}-{version}.deb"
+    out_deb = out_dir / common.package_filename(
+        platform_key="linux",
+        architecture=deb_arch,
+        version=version,
+        package_format="deb",
+    )
     build_cmd = [
         "dpkg-deb",
         "--build",
