@@ -26,7 +26,7 @@ import sys
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List
 
 try:
     import yaml  # type: ignore
@@ -143,7 +143,11 @@ def load_app_layout(
 ) -> AppLayout:
     data = yaml_load_file(project_yaml_path)
     apps = data.get("apps", {}) or {}
-    app_cfg = apps.get(app_key, {}) or {}
+    if not isinstance(apps, dict):
+        raise ValueError("apps must be a map")
+    app_cfg = apps.get(app_key)
+    if not isinstance(app_cfg, dict):
+        raise ValueError(f"apps.{app_key} missing or invalid")
 
     base_dir = str(data.get("base_dir", "."))
     project_base = (project_yaml_path.parent / base_dir).resolve()
@@ -156,9 +160,17 @@ def load_app_layout(
     target_rootfs = Path(_expand_vars(target_str)).resolve()
 
     modules = app_cfg.get("modules", {}) or {}
+    data_paths_raw = app_cfg.get("data_paths", []) or []
+    clean_paths_raw = app_cfg.get("clean_paths", []) or []
+    if not isinstance(modules, dict):
+        raise ValueError(f"apps.{app_key}.modules must be a map")
+    if not isinstance(data_paths_raw, list):
+        raise ValueError(f"apps.{app_key}.data_paths must be a list")
+    if not isinstance(clean_paths_raw, list):
+        raise ValueError(f"apps.{app_key}.clean_paths must be a list")
     module_paths = [str(p) for p in modules.values()]
-    data_paths = [str(p) for p in (app_cfg.get("data_paths", []) or [])]
-    clean_paths = [str(p) for p in (app_cfg.get("clean_paths", []) or [])]
+    data_paths = [str(p) for p in data_paths_raw]
+    clean_paths = [str(p) for p in clean_paths_raw]
 
     return AppLayout(
         source_rootfs=source_rootfs,
@@ -227,6 +239,27 @@ def _as_str(v: Any) -> str:
     return str(v)
 
 
+def _parse_bool(value: Any, *, field_name: str, default: bool = False) -> bool:
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in ("true", "yes", "1", "on"):
+            return True
+        if normalized in ("false", "no", "0", "off"):
+            return False
+    raise ValueError(f"{field_name} must be a boolean value")
+
+
+def _parse_component_type(value: Any, *, field_name: str) -> str:
+    kind = _as_str(value or "app").strip()
+    if kind not in ("app", "bundle"):
+        raise ValueError(f"{field_name} must be one of: app, bundle")
+    return kind
+
+
 def _sanitize_id(s: str) -> str:
     out = []
     for ch in s:
@@ -244,6 +277,7 @@ class PublishComponent:
     name: str
     kind: str  # "app" | "bundle"
     optional: bool
+    default_selected: bool
     src: str | None
     default_target: str
     system_service: bool
@@ -262,23 +296,27 @@ def load_win_pkg_components(project_yaml_path: Path) -> List[PublishComponent]:
         if not isinstance(cfg, dict):
             raise ValueError(f"publish.win_pkg.apps.{key} must be a map")
         name = _as_str(cfg.get("name", key)).strip() or key
-        kind = _as_str(cfg.get("type", "")).strip() or "app"
-        optional = bool(cfg.get("optional", False))
+        kind = _parse_component_type(cfg.get("type", "app"), field_name=f"publish.win_pkg.apps.{key}.type")
+        optional = _parse_bool(cfg.get("optional", False), field_name=f"publish.win_pkg.apps.{key}.optional")
+        default_selected = _parse_bool(
+            cfg.get("default_selected", False),
+            field_name=f"publish.win_pkg.apps.{key}.default_selected",
+        )
         src = _as_str(cfg.get("src", "")).strip() or None
         default_target = _as_str(cfg.get("default_target", "")).strip()
         if not default_target:
             raise ValueError(f"publish.win_pkg.apps.{key} missing default_target")
-        system_service_val = cfg.get("system_service", False)
-        if isinstance(system_service_val, str):
-            system_service = system_service_val.lower().strip() == "true"
-        else:
-            system_service = bool(system_service_val)
+        system_service = _parse_bool(
+            cfg.get("system_service", False),
+            field_name=f"publish.win_pkg.apps.{key}.system_service",
+        )
         components.append(
             PublishComponent(
                 key=_as_str(key),
                 name=name,
                 kind=kind,
                 optional=optional,
+                default_selected=default_selected,
                 src=src,
                 default_target=default_target,
                 system_service=system_service,
@@ -306,19 +344,30 @@ def load_win_pkg_components_from_manifest(manifest_path: Path) -> List[PublishCo
         platform_cfg = (project.get("platforms", {}) or {}).get("windows")
         if not isinstance(platform_cfg, dict):
             raise ValueError(f"manifest install project '{key}' missing windows platform config")
-        system_service_val = platform_cfg.get("system_service", False)
-        if isinstance(system_service_val, str):
-            system_service = system_service_val.lower().strip() == "true"
-        else:
-            system_service = bool(system_service_val)
+        system_service = _parse_bool(
+            platform_cfg.get("system_service", False),
+            field_name=f"manifest.install_projects.{key}.platforms.windows.system_service",
+        )
         components.append(
             PublishComponent(
                 key=_as_str(platform_cfg.get("key", key)),
                 name=_as_str(platform_cfg.get("name", project.get("name", key))).strip() or _as_str(key),
-                kind=_as_str(platform_cfg.get("kind", project.get("kind", "app"))).strip() or "app",
-                optional=bool(platform_cfg.get("optional", False)),
+                kind=_parse_component_type(
+                    platform_cfg.get("kind", project.get("kind", "app")),
+                    field_name=f"manifest.install_projects.{key}.platforms.windows.kind",
+                ),
+                optional=_parse_bool(
+                    platform_cfg.get("optional", False),
+                    field_name=f"manifest.install_projects.{key}.platforms.windows.optional",
+                ),
+                default_selected=_parse_bool(
+                    platform_cfg.get("default_selected", False),
+                    field_name=f"manifest.install_projects.{key}.platforms.windows.default_selected",
+                ),
                 src=_as_str(platform_cfg.get("src", "")).strip() or None,
-                default_target=_as_str(platform_cfg.get("default_target", "")).strip(),
+                default_target=_as_str(
+                    platform_cfg.get("default_target_raw") or platform_cfg.get("default_target", "")
+                ).strip(),
                 system_service=system_service,
             )
         )
@@ -557,7 +606,7 @@ def generate_nsis_script(
     
     # Installer attributes
     lines.append(f'Name "${{PRODUCT_NAME}} ${{PRODUCT_VERSION}}"')
-    lines.append(f'OutFile "buckyos-win-{architecture}-{version}.exe"')
+    lines.append(f'OutFile "buckyos-windows-{architecture}-{version}.exe"')
     
     # Set default install directory based on architecture
     if nsis_arch == "x64":
@@ -903,16 +952,17 @@ def generate_nsis_script(
         lines.append("FunctionEnd")
         lines.append("")
     
-    # Sections for each component - all selected by default (no /o flag for optional)
+    # Sections for each component.
     has_service = False
     has_bundle = False
     for idx, comp in enumerate(components):
         section_id = f"SEC_{_sanitize_id(comp.key).upper()}"
         var_name = f"InstDir_{_sanitize_id(comp.key).replace('-', '_')}"
         
-        # All components selected by default, but optional ones can be deselected
-        # Using empty flags means selected by default
-        lines.append(f'Section "{comp.name}" {section_id}')
+        section_flag = " /o" if comp.optional and not comp.default_selected else ""
+        lines.append(f'Section{section_flag} "{comp.name}" {section_id}')
+        if not comp.optional:
+            lines.append("  SectionIn RO")
         
         # Source files - use component-specific install directory
         comp_payload = payload_dir / comp.key
@@ -1157,6 +1207,7 @@ def build_win_installer(
             print(f"\n[dry-run] Component: {comp.name} ({comp.key})")
             print(f"  Type: {comp.kind}")
             print(f"  Optional: {comp.optional}")
+            print(f"  Default Selected: {comp.default_selected}")
             print(f"  System Service: {comp.system_service}")
             print(f"  Source: {src}")
             print(f"  Target: {comp.default_target}")
@@ -1198,8 +1249,8 @@ def build_win_installer(
 
     if dry_run:
         print(f"\n[dry-run] Would generate NSIS script: {nsi_file}")
-        print(f"[dry-run] Would compile installer to: {out_dir / f'buckyos-win-{architecture}-{version}.exe'}")
-        return out_dir / f"buckyos-win-{architecture}-{version}.exe"
+        print(f"[dry-run] Would compile installer to: {out_dir / f'buckyos-windows-{architecture}-{version}.exe'}")
+        return out_dir / f"buckyos-windows-{architecture}-{version}.exe"
     
     # Generate NSIS script
     license_file = WIN_PKG_PROJECT_DIR / "license.txt"
@@ -1255,8 +1306,8 @@ def build_win_installer(
         raise RuntimeError(f"NSIS compilation failed with code {rc}")
     
     # Move output to target directory
-    built_exe = work_dir / f"buckyos-win-{architecture}-{version}.exe"
-    out_exe = out_dir / f"buckyos-win-{architecture}-{version}.exe"
+    built_exe = work_dir / f"buckyos-windows-{architecture}-{version}.exe"
+    out_exe = out_dir / f"buckyos-windows-{architecture}-{version}.exe"
     
     if built_exe.exists():
         shutil.move(str(built_exe), str(out_exe))

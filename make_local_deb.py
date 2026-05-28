@@ -130,7 +130,11 @@ def load_app_layout(
 ) -> AppLayout:
     data = yaml_load_file(project_yaml_path)
     apps = data.get("apps", {}) or {}
-    app_cfg = apps.get(app_key, {}) or {}
+    if not isinstance(apps, dict):
+        raise ValueError("apps must be a map")
+    app_cfg = apps.get(app_key)
+    if not isinstance(app_cfg, dict):
+        raise ValueError(f"apps.{app_key} missing or invalid")
 
     base_dir = str(data.get("base_dir", "."))
     project_base = (project_yaml_path.parent / base_dir).resolve()
@@ -143,9 +147,17 @@ def load_app_layout(
     target_rootfs = Path(_expand_vars(target_str)).resolve()
 
     modules = app_cfg.get("modules", {}) or {}
+    data_paths_raw = app_cfg.get("data_paths", []) or []
+    clean_paths_raw = app_cfg.get("clean_paths", []) or []
+    if not isinstance(modules, dict):
+        raise ValueError(f"apps.{app_key}.modules must be a map")
+    if not isinstance(data_paths_raw, list):
+        raise ValueError(f"apps.{app_key}.data_paths must be a list")
+    if not isinstance(clean_paths_raw, list):
+        raise ValueError(f"apps.{app_key}.clean_paths must be a list")
     module_paths = [str(p) for p in modules.values()]
-    data_paths = [str(p) for p in (app_cfg.get("data_paths", []) or [])]
-    clean_paths = [str(p) for p in (app_cfg.get("clean_paths", []) or [])]
+    data_paths = [str(p) for p in data_paths_raw]
+    clean_paths = [str(p) for p in clean_paths_raw]
 
     return AppLayout(
         source_rootfs=source_rootfs,
@@ -411,6 +423,7 @@ def _resolve_buckyos_src(
     source_override: Path | None,
     app_publish_dir: Path,
     layout: AppLayout,
+    allow_missing: bool = False,
 ) -> Path:
     candidates: List[Path] = []
     if source_override:
@@ -421,6 +434,8 @@ def _resolve_buckyos_src(
     for c in candidates:
         if c.exists():
             return c
+    if allow_missing:
+        return candidates[0]
     raise FileNotFoundError(
         "buckyos source rootfs not found. Tried: "
         + ", ".join(str(c) for c in candidates)
@@ -465,7 +480,12 @@ def build_deb(
         manifest_path=manifest_path,
         target_override="/opt/buckyos",
     )
-    src_root = _resolve_buckyos_src(source_override=source_rootfs, app_publish_dir=app_publish_dir, layout=layout)
+    src_root = _resolve_buckyos_src(
+        source_override=source_rootfs,
+        app_publish_dir=app_publish_dir,
+        layout=layout,
+        allow_missing=dry_run,
+    )
 
     if dry_run:
         print(f"[dry-run] stage buckyos: {src_root} -> {payload_root}")
