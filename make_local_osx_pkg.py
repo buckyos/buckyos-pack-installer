@@ -395,6 +395,12 @@ def _resolve_component_target(component: PublishComponent) -> Path:
     return Path(_expand_vars(component.default_target))
 
 
+def _resolve_component_pkg_target(component: PublishComponent) -> Path:
+    if component.key == "buckycli":
+        return Path("/Library/Application Support/BuckyOS/buckycli")
+    return _resolve_component_target(component)
+
+
 def _copy_dir_contents(src_dir: Path, dst_dir: Path) -> None:
     dst_dir.mkdir(parents=True, exist_ok=True)
     for child in src_dir.iterdir():
@@ -425,9 +431,15 @@ def _stage_buckyos_app_root(*, src_root: Path, dst_root: Path, layout: AppLayout
         rel_s = rel_s.rstrip("/")
         s = _source_path_for(layout, rel, item_kind="module", source_root_override=src_root)
         d = dst_root / rel_s
+        if not s.exists():
+            raise FileNotFoundError(
+                f"module source missing: '{rel}' -> '{s}'. "
+                f"Please ensure it exists under the publish root ({src_root}), "
+                f"or remove it from the app modules list."
+            )
         if s.is_dir():
             _copytree_filtered(s, d)
-        elif s.exists():
+        else:
             d.parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(s, d)
 
@@ -484,51 +496,8 @@ def _write_distribution_xml(
     lines.append('<installer-gui-script minSpecVersion="2">')
     lines.append(f"  <title>{_xml_escape(title)}</title>")
     lines.append('  <options customize="always" />')
-    lines.append('  <installation-check script="installationCheck()"/>')
-    lines.append("  <script><![CDATA[")
-    lines.append("    function pathExists(path) {")
-    lines.append("        try {")
-    lines.append("            return system.files.fileExistsAtPath(path);")
-    lines.append("        } catch (error) {")
-    lines.append("            system.log('pathExists failed for ' + path + ': ' + error);")
-    lines.append("            return false;")
-    lines.append("        }")
-    lines.append("    }")
-    lines.append("    function bundleExists(path) {")
-    lines.append("        try {")
-    lines.append("            var bundle = system.files.bundleAtPath(path);")
-    lines.append("            return bundle != null;")
-    lines.append("        } catch (error) {")
-    lines.append("            system.log('bundleExists failed for ' + path + ': ' + error);")
-    lines.append("            return false;")
-    lines.append("        }")
-    lines.append("    }")
-    lines.append("    function installationCheckFailure(message) {")
-    lines.append("            my.result.title = 'Docker Required';")
-    lines.append("            my.result.message = message;")
-    lines.append("            my.result.type = 'Fatal';")
-    lines.append("            return false;")
-    lines.append("    }")
-    lines.append("    function installationCheck() {")
-    lines.append("        var orbStackApp = bundleExists('/Applications/OrbStack.app');")
-    lines.append("        var dockerCli =")
-    lines.append("            pathExists('/opt/homebrew/bin/docker') ||")
-    lines.append("            pathExists('/usr/local/bin/docker') ||")
-    lines.append("            pathExists('/usr/bin/docker');")
-    lines.append("        var dockerSocket = pathExists('/var/run/docker.sock');")
-    lines.append("        if (!orbStackApp && !dockerCli) {")
-    lines.append(
-        "            return installationCheckFailure('Please install and start OrbStack first.\\nDownload: https://orbstack.dev/download');"
-    )
-    lines.append("        }")
-    lines.append("        if (!dockerSocket) {")
-    lines.append(
-        "            return installationCheckFailure('OrbStack appears to be installed, but Docker is not ready yet.\\nPlease start OrbStack first.\\nDownload: https://orbstack.dev/download');"
-    )
-    lines.append("        }")
-    lines.append("        return true;")
-    lines.append("    }")
-    lines.append("  ]]></script>")
+    # Docker availability is checked by buckyos_preinstall, so BuckyOSApp-only
+    # or buckycli-only installs are not blocked by a global Distribution check.
 
     # Optional HTML screens (if present in resources).
     for tag, filename in (("welcome", "welcome.html"), ("license", "license.html"), ("conclusion", "conclusion.html")):
@@ -611,7 +580,7 @@ def build_macos_distribution_pkg(
         if not src.exists() and not dry_run:
             raise FileNotFoundError(f"component source not found: {comp.key} -> {src}")
 
-        target = _resolve_component_target(comp)
+        target = _resolve_component_pkg_target(comp)
         target_rel = str(target).lstrip("/")
         component_root = roots_dir / comp.key
         if dry_run:
@@ -624,13 +593,12 @@ def build_macos_distribution_pkg(
             component_root.mkdir(parents=True, exist_ok=True)
 
             dst = component_root / target_rel
-            if comp.key == "buckyos":
-                # Special staging to honor data_paths overwrite-install semantics.
+            if comp.kind == "app":
                 layout = resolve_app_layout(
-                    app_key="buckyos",
+                    app_key=comp.key,
                     project_yaml_path=project_yaml_path,
                     manifest_path=manifest_path,
-                    target_override="/opt/buckyos",
+                    target_override=str(target),
                 )
                 _stage_buckyos_app_root(src_root=src, dst_root=dst, layout=layout)
             else:
@@ -856,31 +824,10 @@ def verify_pkg(
                 root = None
 
             if root is not None:
-                install_check = root.find(".//installation-check")
-                if install_check is None:
-                    failures.append("missing installation-check in Distribution")
-                else:
-                    if install_check.attrib.get("script") != "installationCheck()":
-                        failures.append(
-                            "Distribution installation-check should call installationCheck()"
-                        )
-
                 script_elem = root.find(".//script")
                 script_text = "" if script_elem is None or script_elem.text is None else script_elem.text
-                required_dist_script_snippets = [
-                    "function installationCheck()",
-                    "system.files.fileExistsAtPath(path)",
-                    "system.files.bundleAtPath(path)",
-                    "bundleExists('/Applications/OrbStack.app')",
-                    "pathExists('/var/run/docker.sock')",
-                    "my.result.type = 'Fatal'",
-                    "my.result.title = 'Docker Required'",
-                    "Please install and start OrbStack first.",
-                    "https://orbstack.dev/download",
-                ]
-                for snippet in required_dist_script_snippets:
-                    if snippet not in script_text:
-                        failures.append(f"Distribution script missing Docker installation-check snippet: {snippet}")
+                if "/var/run/docker.sock" in script_text:
+                    failures.append("Distribution must not require /var/run/docker.sock")
 
                 # Collect choices
                 choices = {c.attrib.get("id", ""): c for c in root.findall(".//choice")}
@@ -928,7 +875,7 @@ def verify_pkg(
         buckyosapp_pkg_dir = expanded / "buckyosapp.pkg"
         if buckyosapp_pkg_dir.exists():
             app_payload_files = set(_pkg_payload_files(buckyosapp_pkg_dir))
-            app_prefix = "Library/Application Support/BuckyOS/BuckyOS.app/Contents/"
+            app_prefix = "Applications/BuckyOS.app/Contents/"
             if not any(p.lstrip("./").lstrip("/").startswith(app_prefix) for p in app_payload_files):
                 failures.append(f"BuckyOSApp payload missing expected app bundle content under '{app_prefix}'")
 
@@ -936,10 +883,10 @@ def verify_pkg(
             if postinstall_text is None:
                 failures.append("BuckyOSApp missing postinstall script")
             else:
-                if 'rm -rf "$DEST_APP"' not in postinstall_text:
-                    failures.append('BuckyOSApp postinstall should remove existing "$DEST_APP" before copy')
-                if 'ditto "$STAGE_APP" "$DEST_APP"' not in postinstall_text:
-                    failures.append('BuckyOSApp postinstall should copy "$STAGE_APP" to "$DEST_APP"')
+                if 'DEST_APP="/Applications/BuckyOS.app"' not in postinstall_text:
+                    failures.append("BuckyOSApp postinstall should target /Applications/BuckyOS.app")
+                if "lsregister" not in postinstall_text:
+                    failures.append("BuckyOSApp postinstall should refresh LaunchServices registration")
 
         # Verify data_paths payload staging for buckyos.
         buckyos_pkg_dir = expanded / "buckyos.pkg"

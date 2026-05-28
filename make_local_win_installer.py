@@ -389,6 +389,21 @@ def _resolve_component_target(component: PublishComponent) -> str:
     return _expand_vars(component.default_target)
 
 
+def _nsis_default_target(component: PublishComponent) -> str:
+    target = component.default_target
+    replacements = {
+        "%APPDATA%": "$APPDATA",
+        "%LOCALAPPDATA%": "$LOCALAPPDATA",
+        "%USERPROFILE%": "$PROFILE",
+        "${APPDATA}": "$APPDATA",
+        "${LOCALAPPDATA}": "$LOCALAPPDATA",
+        "${USERPROFILE}": "$PROFILE",
+    }
+    for raw, nsis in replacements.items():
+        target = target.replace(raw, nsis)
+    return target
+
+
 def _copy_dir_contents(src_dir: Path, dst_dir: Path) -> None:
     dst_dir.mkdir(parents=True, exist_ok=True)
     for child in src_dir.iterdir():
@@ -502,9 +517,15 @@ def _stage_buckyos_app_root(*, src_root: Path, dst_root: Path, layout: AppLayout
         rel_s = rel_s.rstrip("/\\")
         s = src_root / rel_s
         d = dst_root / rel_s
+        if not s.exists():
+            raise FileNotFoundError(
+                f"module source missing: '{rel}' -> '{s}'. "
+                f"Please ensure it exists under the publish root ({src_root}), "
+                "or remove it from apps.buckyos.modules."
+            )
         if s.is_dir():
             _copytree_filtered(s, d)
-        elif s.exists():
+        else:
             d.parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(s, d)
 
@@ -518,8 +539,11 @@ def _stage_buckyos_app_root(*, src_root: Path, dst_root: Path, layout: AppLayout
         s = src_root / rel_s
         d = defaults_root / rel_s
         if not s.exists():
-            print(f"[warn] data_paths source missing: '{rel}' -> '{s}', skipping")
-            continue
+            raise FileNotFoundError(
+                f"data_paths source missing: '{rel}' -> '{s}'. "
+                f"Please ensure it exists under the publish root ({src_root}), "
+                "or remove it from apps.buckyos.data_paths."
+            )
         if s.is_dir():
             _copytree_filtered(s, d)
         else:
@@ -642,6 +666,7 @@ def generate_nsis_script(
     lines.append("Var ExistingBuckyRoot")
     lines.append("Var BestInstallDrive")
     lines.append("Var LaunchAfterInstall")
+    lines.append("Var InstallerLogPath")
     for comp in components:
         var_name = f"InstDir_{_sanitize_id(comp.key).replace('-', '_')}"
         lines.append(f"Var {var_name}")
@@ -894,6 +919,11 @@ def generate_nsis_script(
     if nsis_arch == "x64":
         lines.append('  ; Check if running on 64-bit Windows')
         lines.append('  ${IfNot} ${RunningX64}')
+        lines.append("    IfSilent silent_bad_arch interactive_bad_arch")
+        lines.append("silent_bad_arch:")
+        lines.append("    SetErrorLevel 10")
+        lines.append("    Abort")
+        lines.append("interactive_bad_arch:")
         lines.append('    MessageBox MB_OK|MB_ICONSTOP "This installer requires 64-bit Windows."')
         lines.append('    Abort')
         lines.append('  ${EndIf}')
@@ -901,43 +931,13 @@ def generate_nsis_script(
         lines.append('  SetRegView 64')
         lines.append("")
     
-    # Initialize install directories with default values
-    lines.append("  ; Pick the local disk with largest free space and use X:\\buckyos\\ as default")
-    lines.append("  Call SelectBestInstallDrive")
-    lines.append('  ; Initialize default install directories')
+    lines.append('  ; Initialize default install directories from bucky_project.yaml')
     for comp in components:
         var_name = f"InstDir_{_sanitize_id(comp.key).replace('-', '_')}"
-        lines.append(f'  StrCpy ${var_name} "$BestInstallDrive\\buckyos\\"')
+        lines.append(f'  StrCpy ${var_name} "{_escape_nsis_string(_nsis_default_target(comp))}"')
     lines.append('  StrCpy $LaunchAfterInstall ""')
+    lines.append('  StrCpy $InstallerLogPath "$TEMP\\buckyos-windows-${PRODUCT_ARCH}-${PRODUCT_VERSION}.log"')
     lines.append("")
-    
-    lines.append('  ; Check Docker Desktop availability for current user context')
-    lines.append("  Call CheckDockerDesktopForUser")
-    lines.append('  ${If} $DockerCheckCode != "0"')
-    lines.append('    ${If} $DockerCheckCode == "1"')
-    lines.append('      MessageBox MB_YESNO|MB_ICONSTOP "Docker Desktop is required.$\\r$\\nThe installer could not find the docker command in the current PATH.$\\r$\\n$\\r$\\nOpen Docker Desktop install guide?" IDYES +2')
-    lines.append("      Abort")
-    lines.append('      ExecShell "open" "https://docs.docker.com/desktop/setup/install/windows-install/"')
-    lines.append("      Abort")
-    lines.append("    ${Else}")
-    lines.append('      MessageBox MB_OK|MB_ICONSTOP "Docker Desktop was found, but Docker Engine is not reachable right now.$\\r$\\nPlease open Docker Desktop, wait until it finishes starting, then retry this step."')
-    lines.append("      Abort")
-    lines.append("    ${EndIf}")
-    lines.append("  ${EndIf}")
-    lines.append("")
-    
-    lines.append("  Call IsVCRedistInstalled")
-    lines.append('  ${If} $VCRedistInstalled != "1"')
-    if bundled_vcredist and bundled_vcredist.exists():
-        lines.append("    Call ExtractBundledVCRedist")
-        lines.append("    Call TryInstallVCRedist")
-        lines.append("    Abort")
-    else:
-        lines.append('    MessageBox MB_YESNO|MB_ICONSTOP "Visual C++ 2015-2022 (x64) runtime is not registered.$\\r$\\nOpen Microsoft download page?" IDYES +2')
-        lines.append("    Abort")
-        lines.append('    ExecShell "open" "https://aka.ms/vs/17/release/vc_redist.x64.exe"')
-        lines.append("    Abort")
-    lines.append('  ${EndIf}')
     lines.append("FunctionEnd")
     lines.append("")
 
@@ -968,13 +968,86 @@ def generate_nsis_script(
         comp_payload = payload_dir / comp.key
         if comp_payload.exists():
             if comp.system_service:
+                dep_label = _sanitize_id(comp.key).replace("-", "_")
+                lines.append(f"dep_check_{dep_label}:")
+                lines.append("  ; Check Docker only for the selected service component")
+                lines.append("  Call CheckDockerDesktopForUser")
+                lines.append('  ${If} $DockerCheckCode != "0"')
+                lines.append('    ${If} $DockerCheckCode == "1"')
+                lines.append("      IfSilent silent_docker_missing interactive_docker_missing")
+                lines.append("silent_docker_missing:")
+                lines.append('      FileOpen $0 "$InstallerLogPath" a')
+                lines.append('      FileWrite $0 "Docker CLI is required but was not found.$\\r$\\n"')
+                lines.append("      FileClose $0")
+                lines.append("      SetErrorLevel 20")
+                lines.append("      Abort")
+                lines.append("interactive_docker_missing:")
+                lines.append('      MessageBox MB_ABORTRETRYIGNORE|MB_ICONSTOP "Docker Desktop is required.$\\r$\\nThe installer could not find the docker command in the current PATH.$\\r$\\n$\\r$\\nAbort=Cancel, Retry=Retry, Ignore=Open install guide." IDRETRY dep_check_' + dep_label + ' IDIGNORE open_docker_' + dep_label)
+                lines.append("      Abort")
+                lines.append(f"open_docker_{dep_label}:")
+                lines.append('      ExecShell "open" "https://docs.docker.com/desktop/setup/install/windows-install/"')
+                lines.append(f"      Goto dep_check_{dep_label}")
+                lines.append("    ${Else}")
+                lines.append("      IfSilent silent_docker_engine interactive_docker_engine")
+                lines.append("silent_docker_engine:")
+                lines.append('      FileOpen $0 "$InstallerLogPath" a')
+                lines.append('      FileWrite $0 "Docker Engine is not reachable.$\\r$\\n"')
+                lines.append("      FileClose $0")
+                lines.append("      SetErrorLevel 21")
+                lines.append("      Abort")
+                lines.append("interactive_docker_engine:")
+                lines.append('      MessageBox MB_RETRYCANCEL|MB_ICONSTOP "Docker Desktop was found, but Docker Engine is not reachable right now.$\\r$\\nPlease open Docker Desktop, wait until it finishes starting, then retry." IDRETRY dep_check_' + dep_label)
+                lines.append("      Abort")
+                lines.append("    ${EndIf}")
+                lines.append("  ${EndIf}")
+                lines.append("")
+                lines.append("  ; Check Visual C++ runtime only for the selected service component")
+                lines.append("  Call IsVCRedistInstalled")
+                lines.append('  ${If} $VCRedistInstalled != "1"')
+                lines.append("    IfSilent silent_vcredist_missing interactive_vcredist_missing")
+                lines.append("silent_vcredist_missing:")
+                if bundled_vcredist and bundled_vcredist.exists():
+                    lines.append("    Call ExtractBundledVCRedist")
+                    lines.append('    ExecWait \'"$PLUGINSDIR\\vcredist_x64.exe" /quiet /norestart\' $0')
+                    lines.append("    Call IsVCRedistInstalled")
+                    lines.append('    ${If} $VCRedistInstalled == "1"')
+                    lines.append(f"      Goto dep_check_{dep_label}_done")
+                    lines.append("    ${EndIf}")
+                lines.append('    FileOpen $0 "$InstallerLogPath" a')
+                lines.append('    FileWrite $0 "Visual C++ 2015-2022 x64 runtime is missing or installation failed.$\\r$\\n"')
+                lines.append("    FileClose $0")
+                lines.append("    SetErrorLevel 30")
+                lines.append("    Abort")
+                lines.append("interactive_vcredist_missing:")
+                if bundled_vcredist and bundled_vcredist.exists():
+                    lines.append("    Call ExtractBundledVCRedist")
+                    lines.append("    Call TryInstallVCRedist")
+                    lines.append("    Abort")
+                else:
+                    lines.append('    MessageBox MB_ABORTRETRYIGNORE|MB_ICONSTOP "Visual C++ 2015-2022 (x64) runtime is required.$\\r$\\nAbort=Cancel, Retry=Retry, Ignore=Open Microsoft download page." IDRETRY dep_check_' + dep_label + ' IDIGNORE open_vcredist_' + dep_label)
+                    lines.append("    Abort")
+                    lines.append(f"open_vcredist_{dep_label}:")
+                    lines.append('    ExecShell "open" "https://aka.ms/vs/17/release/vc_redist.x64.exe"')
+                    lines.append(f"    Goto dep_check_{dep_label}")
+                lines.append("  ${EndIf}")
+                lines.append(f"dep_check_{dep_label}_done:")
+                lines.append("")
                 lines.append("  ; Stop existing service and running processes before overwrite")
                 lines.append("  Call ExtractBundledStopScript")
                 lines.append("  Call StopExistingBuckyOS")
                 lines.append("  ; Check required ports only when installation actually starts")
+                lines.append(f"port_check_{dep_label}:")
                 lines.append("  Call CheckRequiredPorts")
                 lines.append('  ${If} $PortCheckCode != "0"')
-                lines.append('    MessageBox MB_OK|MB_ICONSTOP "Required port $PortCheckPort cannot be bound.$\\r$\\nPlease free ports 3180, 80, and 443 (or stop conflicting services) before installing."')
+                lines.append("    IfSilent silent_port_busy interactive_port_busy")
+                lines.append("silent_port_busy:")
+                lines.append('    FileOpen $0 "$InstallerLogPath" a')
+                lines.append('    FileWrite $0 "Required port $PortCheckPort is busy.$\\r$\\n"')
+                lines.append("    FileClose $0")
+                lines.append("    SetErrorLevel 40")
+                lines.append("    Abort")
+                lines.append("interactive_port_busy:")
+                lines.append('    MessageBox MB_RETRYCANCEL|MB_ICONSTOP "Required port $PortCheckPort cannot be bound.$\\r$\\nPlease free ports 3180, 80, and 443 before installing." IDRETRY port_check_' + dep_label)
                 lines.append("    Abort")
                 lines.append("  ${EndIf}")
             lines.append(f'  SetOutPath "${var_name}"')
@@ -1029,6 +1102,16 @@ def generate_nsis_script(
             lines.append("")
             lines.append(f'  ; Save install directory to registry')
             lines.append(f'  WriteRegStr HKCU "Software\\BuckyOS" "BuckyOSUserDir" "${var_name}"')
+        elif comp.key == "buckycli":
+            lines.append("")
+            lines.append("  ; Add buckycli directory to the current user's PATH")
+            lines.append('  ReadRegStr $0 HKCU "Environment" "Path"')
+            lines.append('  ${If} $0 == ""')
+            lines.append(f'    WriteRegExpandStr HKCU "Environment" "Path" "${var_name}"')
+            lines.append("  ${Else}")
+            lines.append(f'    WriteRegExpandStr HKCU "Environment" "Path" "$0;${var_name}"')
+            lines.append("  ${EndIf}")
+            lines.append('  SendMessage ${HWND_BROADCAST} ${WM_WININICHANGE} 0 "STR:Environment" /TIMEOUT=5000')
         
         # Save each component's install directory to registry for uninstall
         lines.append(f'  WriteRegStr HKCU "Software\\BuckyOS" "InstDir_{comp.key}" "${var_name}"')
@@ -1226,21 +1309,20 @@ def build_win_installer(
         comp_payload = payload_dir / comp.key
         comp_payload.mkdir(parents=True, exist_ok=True)
         
-        if comp.key == "buckyos":
-            # Special staging for buckyos with data_paths semantics
+        if comp.kind == "app":
             layout = resolve_app_layout(
-                app_key="buckyos",
+                app_key=comp.key,
                 project_yaml_path=project_yaml_path,
                 manifest_path=manifest_path,
-                target_override="C:\\opt\\buckyos",
+                target_override=comp.default_target,
             )
             _stage_buckyos_app_root(src_root=src, dst_root=comp_payload, layout=layout)
             
-            # Copy scripts to payload
-            scripts_src = WIN_PKG_PROJECT_DIR / "scripts"
-            scripts_dst = comp_payload / "scripts"
-            if scripts_src.exists():
-                _copytree_filtered(scripts_src, scripts_dst)
+            if comp.system_service:
+                scripts_src = WIN_PKG_PROJECT_DIR / "scripts"
+                scripts_dst = comp_payload / "scripts"
+                if scripts_src.exists():
+                    _copytree_filtered(scripts_src, scripts_dst)
         else:
             if src.is_dir():
                 _copy_dir_contents(src, comp_payload)

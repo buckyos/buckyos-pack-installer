@@ -256,9 +256,15 @@ def _stage_buckyos_app_root(*, src_root: Path, dst_root: Path, layout: AppLayout
         rel_s = rel_s.rstrip("/")
         s = _source_path_for(layout, rel, item_kind="module", source_root_override=src_root)
         d = dst_root / rel_s
+        if not s.exists():
+            raise FileNotFoundError(
+                f"module source missing: '{rel}' -> '{s}'. "
+                f"Please ensure it exists under the buckyos publish root ({src_root}), "
+                "or remove it from apps.buckyos.modules."
+            )
         if s.is_dir():
             _copytree_filtered(s, d)
-        elif s.exists():
+        else:
             d.parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(s, d)
 

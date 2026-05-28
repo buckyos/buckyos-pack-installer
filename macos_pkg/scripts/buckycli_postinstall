@@ -25,12 +25,29 @@ if [ -z "$HOME_DIR" ] || [ ! -d "$HOME_DIR" ]; then
   exit 0
 fi
 
-DEST_DIR="$HOME_DIR/buckycli"
+DEST_DIR="$HOME_DIR/.buckycli"
 mkdir -p "$DEST_DIR"
 ditto "$STAGE_DIR" "$DEST_DIR"
 
 USER_GROUP="$(id -gn "$CONSOLE_USER" 2>/dev/null || echo staff)"
 chown -R "$CONSOLE_USER":"$USER_GROUP" "$DEST_DIR" || true
+
+ensure_path_entry() {
+  local profile="$1"
+  local line='export PATH="$HOME/.buckycli:$PATH"'
+  if [ ! -f "$profile" ]; then
+    printf '\n%s\n' "$line" >> "$profile" || true
+    chown "$CONSOLE_USER":"$USER_GROUP" "$profile" >/dev/null 2>&1 || true
+    return 0
+  fi
+  if ! grep -F '$HOME/.buckycli' "$profile" >/dev/null 2>&1; then
+    printf '\n%s\n' "$line" >> "$profile" || true
+  fi
+}
+
+ensure_path_entry "$HOME_DIR/.zprofile"
+ensure_path_entry "$HOME_DIR/.bash_profile"
+
 echo "[buckycli] postinstall: installed to $DEST_DIR for user $CONSOLE_USER"
 # BEGIN AUTO-GENERATED: data_paths
 # END AUTO-GENERATED: data_paths
