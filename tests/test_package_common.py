@@ -101,6 +101,30 @@ class PackageCommonTests(unittest.TestCase):
                 mapped.resolve(),
             )
 
+    def test_unexpected_payload_paths(self) -> None:
+        unexpected = common.unexpected_payload_paths(
+            [
+                "./opt",
+                "./opt/buckyos",
+                "./opt/buckyos/bin/node-daemon/node_daemon",
+                "./opt/buckyos/.buckyos_installer_defaults/etc/node_gateway.json",
+                "./opt/buckyos/data/user.db",
+                "./Applications/BuckyOS.app/Contents/Info.plist",
+            ],
+            allowed_prefixes=[
+                "opt/buckyos/bin/node-daemon",
+                "opt/buckyos/.buckyos_installer_defaults/etc/node_gateway.json",
+            ],
+            allowed_exact=["opt", "opt/buckyos", "opt/buckyos/.buckyos_installer_defaults"],
+        )
+        self.assertEqual(
+            unexpected,
+            [
+                "Applications/BuckyOS.app/Contents/Info.plist",
+                "opt/buckyos/data/user.db",
+            ],
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

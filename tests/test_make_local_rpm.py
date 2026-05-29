@@ -45,6 +45,53 @@ class MakeLocalRpmTests(unittest.TestCase):
         self.assertIn("/etc/systemd/system/buckyos.service", spec)
         self.assertIn('cp -a /tmp/buckyos-payload/. "%{buildroot}/"', spec)
 
+    def test_verify_payload_contract_allows_declared_paths_only(self) -> None:
+        layout = rpm.AppLayout(
+            source_rootfs=Path("/stage/buckyos"),
+            target_rootfs=Path("/opt/buckyos"),
+            module_paths=["bin/node-daemon/"],
+            data_paths=["etc/node_gateway.json"],
+            clean_paths=[],
+            module_source_paths={},
+            data_source_paths={},
+        )
+
+        failures: list[str] = []
+        rpm._verify_linux_payload_contract(
+            payload_paths=[
+                "/opt",
+                "/opt/buckyos",
+                "/opt/buckyos/bin",
+                "/opt/buckyos/bin/node-daemon",
+                "/opt/buckyos/bin/node-daemon/node_daemon",
+                "/opt/buckyos/.buckyos_installer_defaults",
+                "/opt/buckyos/.buckyos_installer_defaults/etc",
+                "/opt/buckyos/.buckyos_installer_defaults/etc/node_gateway.json",
+                "/etc",
+                "/etc/systemd",
+                "/etc/systemd/system",
+                "/etc/systemd/system/buckyos.service",
+            ],
+            layout=layout,
+            failures=failures,
+            package_kind="rpm",
+            include_systemd_service=True,
+        )
+        self.assertEqual(failures, [])
+
+        rpm._verify_linux_payload_contract(
+            payload_paths=[
+                "/opt/buckyos/data/user.db",
+                "/Applications/BuckyOS.app/Contents/Info.plist",
+            ],
+            layout=layout,
+            failures=failures,
+            package_kind="rpm",
+            include_systemd_service=True,
+        )
+        self.assertTrue(any("undeclared paths" in failure for failure in failures))
+        self.assertTrue(any("BuckyOS.app" in failure for failure in failures))
+
 
 if __name__ == "__main__":
     unittest.main()

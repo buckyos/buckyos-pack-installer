@@ -283,6 +283,106 @@ def _run(cmd: List[str], dry_run: bool, cwd: Path | None = None) -> None:
     subprocess.run(cmd, check=True, cwd=cwd)
 
 
+LINUX_REQUIRED_DEPS = ("python3", "curl", "openssl", "psmisc")
+LINUX_DOCKER_DEPS = ("docker.io", "docker-ce", "moby-engine", "docker-engine")
+
+
+def _dependency_present(dep_text: str, dep_name: str) -> bool:
+    return re.search(rf"(^|[,\s|()]){re.escape(dep_name)}([,\s|()<>:=]|$)", dep_text) is not None
+
+
+def _verify_linux_dependencies(dep_text: str, failures: List[str], *, package_kind: str) -> None:
+    for dep_name in LINUX_REQUIRED_DEPS:
+        if not _dependency_present(dep_text, dep_name):
+            failures.append(f"{package_kind} dependency missing: {dep_name}")
+    if not any(_dependency_present(dep_text, dep_name) for dep_name in LINUX_DOCKER_DEPS):
+        failures.append(f"{package_kind} dependency missing Docker provider alternative")
+
+
+def _linux_payload_allowlist(layout: AppLayout, *, include_systemd_service: bool) -> tuple[List[str], List[str]]:
+    root = "opt/buckyos"
+    defaults_root = f"{root}/{BUCKYOS_DEFAULTS_SUBDIR}"
+    allowed_prefixes: List[str] = []
+    allowed_exact = ["opt", root, defaults_root]
+
+    def add_prefix(prefix: str) -> None:
+        allowed_prefixes.append(prefix)
+        parts = prefix.split("/")[:-1]
+        while parts:
+            allowed_exact.append("/".join(parts))
+            parts = parts[:-1]
+
+    for rel in layout.module_paths:
+        rel_s = common.normalize_item_relpath(rel)
+        if rel_s:
+            add_prefix(f"{root}/{rel_s}")
+    for rel in layout.data_paths:
+        rel_s = common.normalize_item_relpath(rel)
+        if rel_s:
+            add_prefix(f"{defaults_root}/{rel_s}")
+    if include_systemd_service:
+        allowed_exact.extend(
+            [
+                "etc",
+                "etc/systemd",
+                "etc/systemd/system",
+                "etc/systemd/system/buckyos.service",
+            ]
+        )
+    return allowed_prefixes, allowed_exact
+
+
+def _verify_linux_component_keys(component_keys: List[str], failures: List[str], *, package_kind: str) -> None:
+    if "buckyos" not in component_keys:
+        failures.append(f"{package_kind} manifest must include linux component 'buckyos'")
+    for forbidden_key in ("BuckyOSApp", "buckycli"):
+        if forbidden_key in component_keys:
+            failures.append(f"{package_kind} linux package must not expose desktop component '{forbidden_key}'")
+
+
+def _verify_linux_payload_contract(
+    *,
+    payload_paths: List[str],
+    layout: AppLayout,
+    failures: List[str],
+    package_kind: str,
+    include_systemd_service: bool,
+) -> None:
+    normalized_paths = [common.normalize_payload_path(path) for path in payload_paths]
+    allowed_prefixes, allowed_exact = _linux_payload_allowlist(
+        layout,
+        include_systemd_service=include_systemd_service,
+    )
+    unexpected = common.unexpected_payload_paths(
+        normalized_paths,
+        allowed_prefixes=allowed_prefixes,
+        allowed_exact=allowed_exact,
+    )
+    if unexpected:
+        shown = ", ".join(unexpected[:20])
+        suffix = f" ... and {len(unexpected) - 20} more" if len(unexpected) > 20 else ""
+        failures.append(f"{package_kind} payload contains undeclared paths: {shown}{suffix}")
+
+    for bad_name in ("BuckyOS.app", "buckyosapp.exe"):
+        if any(bad_name.lower() in path.lower() for path in normalized_paths):
+            failures.append(f"{package_kind} payload must not include desktop app artifact: {bad_name}")
+
+    root = "opt/buckyos"
+    defaults_root = f"{root}/{BUCKYOS_DEFAULTS_SUBDIR}"
+    for rel in layout.data_paths:
+        rel_s = common.normalize_item_relpath(rel)
+        if not rel_s:
+            continue
+        real_prefix = f"{root}/{rel_s}"
+        defaults_prefix = f"{defaults_root}/{rel_s}"
+        real_present = any(common.payload_path_matches_prefix(path, real_prefix) for path in normalized_paths)
+        defaults_present = any(common.payload_path_matches_prefix(path, defaults_prefix) for path in normalized_paths)
+        if real_present:
+            failures.append(f"data_paths '{rel}' should NOT be in {package_kind} payload at '{real_prefix}'")
+        if not defaults_present:
+            failures.append(f"data_paths '{rel}' missing from {package_kind} defaults payload at '{defaults_prefix}'")
+
+
 def _rm_lines(root_var: str, rel_paths: List[str]) -> List[str]:
     out: List[str] = []
     for rel in rel_paths:
@@ -368,6 +468,23 @@ def _shell_hook_lines(component_keys: List[str], step: str) -> List[str]:
             ]
         )
     return out or [":"]
+
+
+def _verify_expected_linux_hooks(
+    *,
+    script_text: str,
+    component_keys: List[str],
+    step: str,
+    failures: List[str],
+    package_kind: str,
+) -> None:
+    for component_key in component_keys:
+        hook_path = _discover_linux_hook(component_key, step)
+        if hook_path is None:
+            continue
+        marker = f"BEGIN COMPONENT HOOK: {component_key}_{step}"
+        if marker not in script_text:
+            failures.append(f"{package_kind} {step} script missing expected component hook: {hook_path}")
 
 
 def _service_unit() -> str:
@@ -619,7 +736,22 @@ def build_rpm(
     return out_rpm
 
 
-def verify_pkg(*, pkg_path: Path) -> int:
+def _rpm_query(pkg_path: Path, args: List[str]) -> str:
+    result = subprocess.run(
+        ["rpm", *args, str(pkg_path)],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    return result.stdout
+
+
+def verify_pkg(
+    *,
+    pkg_path: Path,
+    project_yaml_path: Path,
+    manifest_path: Path | None = None,
+) -> int:
     if not pkg_path.exists():
         print(f"VERIFY FAIL: .rpm not found: {pkg_path}")
         return 1
@@ -628,15 +760,84 @@ def verify_pkg(*, pkg_path: Path) -> int:
         return 1
 
     failures: List[str] = []
+    layout = resolve_app_layout(
+        app_key="buckyos",
+        project_yaml_path=project_yaml_path,
+        manifest_path=manifest_path,
+        target_override="/opt/buckyos",
+    )
+    component_keys = _linux_component_keys(project_yaml_path, manifest_path)
+    _verify_linux_component_keys(component_keys, failures, package_kind="rpm")
+
     rpm_cmd = shutil.which("rpm")
     if rpm_cmd is None:
         print("[verify] Warning: rpm command not found, skipping rpm metadata inspection")
     else:
-        for cmd in ([rpm_cmd, "-qpi", str(pkg_path)], [rpm_cmd, "-qlp", str(pkg_path)]):
-            try:
-                subprocess.run(cmd, check=True, capture_output=True, text=True)
-            except subprocess.CalledProcessError as err:
-                failures.append(err.stderr.strip() or f"{' '.join(cmd)} failed")
+        try:
+            metadata = _rpm_query(pkg_path, ["-qp", "--qf", "%{NAME}\n%{VERSION}\n%{RELEASE}\n%{ARCH}\n"])
+            meta_lines = metadata.splitlines()
+            name = meta_lines[0] if len(meta_lines) > 0 else ""
+            version = meta_lines[1] if len(meta_lines) > 1 else ""
+            release = meta_lines[2] if len(meta_lines) > 2 else ""
+            arch = meta_lines[3] if len(meta_lines) > 3 else ""
+            if name != "buckyos":
+                failures.append(f"rpm Name should be buckyos, got {name!r}")
+            if not version:
+                failures.append("rpm Version is empty")
+            if not release:
+                failures.append("rpm Release is empty")
+            if arch not in ("x86_64", "aarch64"):
+                failures.append(f"rpm Arch should be x86_64|aarch64, got {arch!r}")
+        except subprocess.CalledProcessError as err:
+            failures.append(err.stderr.strip() or "rpm metadata query failed")
+
+        try:
+            requires_text = _rpm_query(pkg_path, ["-qp", "--requires"])
+            _verify_linux_dependencies(requires_text, failures, package_kind="rpm")
+        except subprocess.CalledProcessError as err:
+            failures.append(err.stderr.strip() or "rpm requires query failed")
+
+        try:
+            payload_paths = _rpm_query(pkg_path, ["-qlp"]).splitlines()
+            _verify_linux_payload_contract(
+                payload_paths=payload_paths,
+                layout=layout,
+                failures=failures,
+                package_kind="rpm",
+                include_systemd_service=True,
+            )
+        except subprocess.CalledProcessError as err:
+            failures.append(err.stderr.strip() or "rpm payload listing failed")
+
+        try:
+            scripts_text = _rpm_query(pkg_path, ["-qp", "--scripts"])
+            required_script_snippets = [
+                'rm -rf "$BUCKYOS_ROOT/bin/"',
+                "systemctl stop buckyos.service >/dev/null 2>&1 || true",
+                "systemctl daemon-reload",
+                "systemctl enable buckyos.service",
+                "systemctl restart buckyos.service",
+                "systemctl disable --now buckyos.service >/dev/null 2>&1 || true",
+            ]
+            for snippet in required_script_snippets:
+                if snippet not in scripts_text:
+                    failures.append(f"rpm scriptlets missing required snippet: {snippet}")
+            _verify_expected_linux_hooks(
+                script_text=scripts_text,
+                component_keys=component_keys,
+                step="preinstall",
+                failures=failures,
+                package_kind="rpm",
+            )
+            _verify_expected_linux_hooks(
+                script_text=scripts_text,
+                component_keys=component_keys,
+                step="postinstall",
+                failures=failures,
+                package_kind="rpm",
+            )
+        except subprocess.CalledProcessError as err:
+            failures.append(err.stderr.strip() or "rpm scriptlet query failed")
 
     file_size = pkg_path.stat().st_size
     print(f"[verify] Package size: {file_size / (1024 * 1024):.2f} MB")
@@ -698,6 +899,8 @@ def main(argv: List[str]) -> int:
 
     p_verify = sub.add_parser("verify-pkg", help="Verify a built Fedora .rpm offline")
     p_verify.add_argument("pkg", help="Path to .rpm")
+    p_verify.add_argument("--project", default=str(PROJECT_YAML), help="Path to bucky_project.yaml")
+    p_verify.add_argument("--manifest", default=None, help="Path to generated project manifest JSON")
 
     args = parser.parse_args(argv[1:])
 
@@ -716,7 +919,11 @@ def main(argv: List[str]) -> int:
         return 0
 
     if args.cmd == "verify-pkg":
-        return verify_pkg(pkg_path=Path(args.pkg).expanduser().resolve())
+        return verify_pkg(
+            pkg_path=Path(args.pkg).expanduser().resolve(),
+            project_yaml_path=Path(args.project),
+            manifest_path=Path(args.manifest).resolve() if args.manifest else None,
+        )
 
     return 1
 

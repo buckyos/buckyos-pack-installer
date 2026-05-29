@@ -18,6 +18,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -541,6 +542,133 @@ def build_deb(
     return out_deb
 
 
+LINUX_REQUIRED_DEPS = ("python3", "curl", "openssl", "psmisc")
+LINUX_DOCKER_DEPS = ("docker.io", "docker-ce", "moby-engine", "docker-engine")
+
+
+def _dependency_present(dep_text: str, dep_name: str) -> bool:
+    return re.search(rf"(^|[,\s|()]){re.escape(dep_name)}([,\s|()<>:=]|$)", dep_text) is not None
+
+
+def _verify_linux_dependencies(dep_text: str, failures: List[str], *, package_kind: str) -> None:
+    for dep_name in LINUX_REQUIRED_DEPS:
+        if not _dependency_present(dep_text, dep_name):
+            failures.append(f"{package_kind} dependency missing: {dep_name}")
+    if not any(_dependency_present(dep_text, dep_name) for dep_name in LINUX_DOCKER_DEPS):
+        failures.append(f"{package_kind} dependency missing Docker provider alternative")
+
+
+def _linux_payload_allowlist(layout: AppLayout, *, include_systemd_service: bool) -> tuple[List[str], List[str]]:
+    root = "opt/buckyos"
+    defaults_root = f"{root}/{BUCKYOS_DEFAULTS_SUBDIR}"
+    allowed_prefixes: List[str] = []
+    allowed_exact = ["opt", root, defaults_root]
+
+    def add_prefix(prefix: str) -> None:
+        allowed_prefixes.append(prefix)
+        parts = prefix.split("/")[:-1]
+        while parts:
+            allowed_exact.append("/".join(parts))
+            parts = parts[:-1]
+
+    for rel in layout.module_paths:
+        rel_s = common.normalize_item_relpath(rel)
+        if rel_s:
+            add_prefix(f"{root}/{rel_s}")
+    for rel in layout.data_paths:
+        rel_s = common.normalize_item_relpath(rel)
+        if rel_s:
+            add_prefix(f"{defaults_root}/{rel_s}")
+    if include_systemd_service:
+        allowed_exact.extend(
+            [
+                "etc",
+                "etc/systemd",
+                "etc/systemd/system",
+                "etc/systemd/system/buckyos.service",
+            ]
+        )
+    return allowed_prefixes, allowed_exact
+
+
+def _verify_linux_component_keys(component_keys: List[str], failures: List[str], *, package_kind: str) -> None:
+    if "buckyos" not in component_keys:
+        failures.append(f"{package_kind} manifest must include linux component 'buckyos'")
+    for forbidden_key in ("BuckyOSApp", "buckycli"):
+        if forbidden_key in component_keys:
+            failures.append(f"{package_kind} linux package must not expose desktop component '{forbidden_key}'")
+
+
+def _verify_linux_payload_contract(
+    *,
+    payload_paths: List[str],
+    layout: AppLayout,
+    failures: List[str],
+    package_kind: str,
+    include_systemd_service: bool,
+) -> None:
+    normalized_paths = [common.normalize_payload_path(path) for path in payload_paths]
+    allowed_prefixes, allowed_exact = _linux_payload_allowlist(
+        layout,
+        include_systemd_service=include_systemd_service,
+    )
+    unexpected = common.unexpected_payload_paths(
+        normalized_paths,
+        allowed_prefixes=allowed_prefixes,
+        allowed_exact=allowed_exact,
+    )
+    if unexpected:
+        shown = ", ".join(unexpected[:20])
+        suffix = f" ... and {len(unexpected) - 20} more" if len(unexpected) > 20 else ""
+        failures.append(f"{package_kind} payload contains undeclared paths: {shown}{suffix}")
+
+    for bad_name in ("BuckyOS.app", "buckyosapp.exe"):
+        if any(bad_name.lower() in path.lower() for path in normalized_paths):
+            failures.append(f"{package_kind} payload must not include desktop app artifact: {bad_name}")
+
+    root = "opt/buckyos"
+    defaults_root = f"{root}/{BUCKYOS_DEFAULTS_SUBDIR}"
+    for rel in layout.data_paths:
+        rel_s = common.normalize_item_relpath(rel)
+        if not rel_s:
+            continue
+        real_prefix = f"{root}/{rel_s}"
+        defaults_prefix = f"{defaults_root}/{rel_s}"
+        real_present = any(common.payload_path_matches_prefix(path, real_prefix) for path in normalized_paths)
+        defaults_present = any(common.payload_path_matches_prefix(path, defaults_prefix) for path in normalized_paths)
+        if real_present:
+            failures.append(f"data_paths '{rel}' should NOT be in {package_kind} payload at '{real_prefix}'")
+        if not defaults_present:
+            failures.append(f"data_paths '{rel}' missing from {package_kind} defaults payload at '{defaults_prefix}'")
+
+
+def _verify_expected_linux_hooks(
+    *,
+    script_text: str,
+    component_keys: List[str],
+    step: str,
+    failures: List[str],
+    package_kind: str,
+) -> None:
+    for component_key in component_keys:
+        hook_path = _discover_linux_hook(component_key, step)
+        if hook_path is None:
+            continue
+        marker = f"BEGIN COMPONENT HOOK: {component_key}_{step}"
+        if marker not in script_text:
+            failures.append(f"{package_kind} {step} script missing expected component hook: {hook_path}")
+
+
+def _deb_control_field(pkg_path: Path, field_name: str) -> str:
+    result = subprocess.run(
+        ["dpkg-deb", "-f", str(pkg_path), field_name],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    return result.stdout.strip()
+
+
 def verify_pkg(
     *,
     pkg_path: Path,
@@ -551,8 +679,11 @@ def verify_pkg(
     Verify a built Debian package using dpkg-deb.
 
     Checks:
-    - File exists and is a valid .deb (basic extraction)
+    - File exists and is a valid .deb
+    - Metadata and dependency declarations match the Linux package contract
+    - Payload paths are declared by module/data items
     - data_paths are staged under defaults, not in real locations
+    - Maintainer scripts contain generated hook/defaults/service blocks
     """
     if not pkg_path.exists():
         print(f"VERIFY FAIL: .deb not found: {pkg_path}")
@@ -572,7 +703,24 @@ def verify_pkg(
         with tempfile.TemporaryDirectory(prefix="buckyos-deb-verify-") as td:
             work = Path(td)
             extract_dir = work / "extract"
+            control_dir = work / "control"
             extract_dir.mkdir(parents=True, exist_ok=True)
+
+            try:
+                package_name = _deb_control_field(pkg_path, "Package")
+                version = _deb_control_field(pkg_path, "Version")
+                architecture = _deb_control_field(pkg_path, "Architecture")
+                depends = _deb_control_field(pkg_path, "Depends")
+                if package_name != "buckyos":
+                    failures.append(f"deb Package should be buckyos, got {package_name!r}")
+                if not version:
+                    failures.append("deb Version is empty")
+                if architecture not in ("amd64", "arm64"):
+                    failures.append(f"deb Architecture should be amd64|arm64, got {architecture!r}")
+                _verify_linux_dependencies(depends, failures, package_kind="deb")
+            except subprocess.CalledProcessError as e:
+                failures.append(f"dpkg-deb control field read failed: {e}")
+
             try:
                 subprocess.run(["dpkg-deb", "-x", str(pkg_path), str(extract_dir)], check=True)
             except subprocess.CalledProcessError as e:
@@ -584,19 +732,72 @@ def verify_pkg(
                     manifest_path=manifest_path,
                     target_override="/opt/buckyos",
                 )
-                root = extract_dir / "opt" / "buckyos"
-                defaults_root = root / BUCKYOS_DEFAULTS_SUBDIR
+                component_keys = _linux_component_keys(project_yaml_path, manifest_path)
+                _verify_linux_component_keys(component_keys, failures, package_kind="deb")
+                payload_paths = [path.relative_to(extract_dir).as_posix() for path in extract_dir.rglob("*")]
+                _verify_linux_payload_contract(
+                    payload_paths=payload_paths,
+                    layout=layout,
+                    failures=failures,
+                    package_kind="deb",
+                    include_systemd_service=False,
+                )
 
-                for rel in layout.data_paths:
-                    rel_s = rel.strip().lstrip("/").rstrip("/")
-                    if not rel_s:
-                        continue
-                    real_path = root / rel_s
-                    defaults_path = defaults_root / rel_s
-                    if real_path.exists():
-                        failures.append(f"data_paths '{rel}' should NOT be in payload at '{real_path}'")
-                    if not defaults_path.exists():
-                        failures.append(f"data_paths '{rel}' missing from defaults payload at '{defaults_path}'")
+            try:
+                subprocess.run(["dpkg-deb", "-e", str(pkg_path), str(control_dir)], check=True)
+            except subprocess.CalledProcessError as e:
+                failures.append(f"dpkg-deb control extract failed: {e}")
+            else:
+                component_keys = _linux_component_keys(project_yaml_path, manifest_path)
+                preinst = control_dir / "preinst"
+                postinst = control_dir / "postinst"
+                if not preinst.exists():
+                    failures.append("deb control missing preinst")
+                    preinst_text = ""
+                else:
+                    preinst_text = preinst.read_text(encoding="utf-8", errors="ignore")
+                if not postinst.exists():
+                    failures.append("deb control missing postinst")
+                    postinst_text = ""
+                else:
+                    postinst_text = postinst.read_text(encoding="utf-8", errors="ignore")
+
+                required_preinst_snippets = [
+                    "# BEGIN AUTO-GENERATED: component_preinstall_hooks",
+                    'rm -rf "$BUCKYOS_ROOT/bin/"',
+                    "systemctl stop buckyos.service >/dev/null 2>&1 || true",
+                    "# BEGIN AUTO-GENERATED: modules",
+                ]
+                for snippet in required_preinst_snippets:
+                    if snippet not in preinst_text:
+                        failures.append(f"deb preinst missing required snippet: {snippet}")
+                _verify_expected_linux_hooks(
+                    script_text=preinst_text,
+                    component_keys=component_keys,
+                    step="preinstall",
+                    failures=failures,
+                    package_kind="deb",
+                )
+
+                required_postinst_snippets = [
+                    "# BEGIN AUTO-GENERATED: data_paths",
+                    "# BEGIN AUTO-GENERATED: component_postinstall_hooks",
+                    "ExecStart=/opt/buckyos/bin/node-daemon/node_daemon --enable_active",
+                    "systemctl stop buckyos.service >/dev/null 2>&1 || true",
+                    "systemctl daemon-reload",
+                    "systemctl enable buckyos.service",
+                    "systemctl start buckyos.service",
+                ]
+                for snippet in required_postinst_snippets:
+                    if snippet not in postinst_text:
+                        failures.append(f"deb postinst missing required snippet: {snippet}")
+                _verify_expected_linux_hooks(
+                    script_text=postinst_text,
+                    component_keys=component_keys,
+                    step="postinstall",
+                    failures=failures,
+                    package_kind="deb",
+                )
 
     # Basic size sanity check
     file_size = pkg_path.stat().st_size

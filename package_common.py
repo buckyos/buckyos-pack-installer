@@ -153,6 +153,39 @@ def source_path_for(
     return source_rootfs / override_rel
 
 
+def normalize_payload_path(path: str) -> str:
+    normalized = path.strip().replace("\\", "/").lstrip("./").lstrip("/").rstrip("/")
+    parts = [part for part in normalized.split("/") if part and part != "."]
+    return "/".join(parts)
+
+
+def payload_path_matches_prefix(path: str, prefix: str) -> bool:
+    normalized_path = normalize_payload_path(path)
+    normalized_prefix = normalize_payload_path(prefix)
+    if not normalized_path or not normalized_prefix:
+        return normalized_path == normalized_prefix
+    return normalized_path == normalized_prefix or normalized_path.startswith(normalized_prefix + "/")
+
+
+def unexpected_payload_paths(
+    payload_paths: Iterable[str],
+    *,
+    allowed_prefixes: Iterable[str],
+    allowed_exact: Iterable[str] = (),
+) -> list[str]:
+    prefixes = [normalize_payload_path(prefix) for prefix in allowed_prefixes if normalize_payload_path(prefix)]
+    exact = {normalize_payload_path(path) for path in allowed_exact}
+    unexpected: list[str] = []
+    for payload_path in payload_paths:
+        normalized = normalize_payload_path(payload_path)
+        if not normalized or normalized in exact:
+            continue
+        if any(payload_path_matches_prefix(normalized, prefix) for prefix in prefixes):
+            continue
+        unexpected.append(normalized)
+    return sorted(set(unexpected))
+
+
 def discover_component_hook(
     *,
     scripts_dirs: Iterable[Path],
