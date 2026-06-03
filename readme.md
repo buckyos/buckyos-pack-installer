@@ -19,7 +19,7 @@ manifest 会固化：
 - `apps.buckyos.*`
 - `publish.macos_pkg.apps.*`
 - `publish.win_pkg.apps.*`
-- 如本地存在 `../cyfs-gateway/src/bucky_project.{yaml,yml,json}`，会把其中 `cyfs-gateway` app 的安装项并入 `buckyos`
+- `publish.*_pkg.apps.*.deps.*`
 
 然后把目录布局、`data_paths`、`clean_paths`、组件列表和默认安装目标固化进最终安装包与安装脚本。安装时不会再回仓库实时读取 `bucky_project.yaml`。
 打包和本地安装时会过滤 `.DS_Store`、`__pycache__` 这类无关文件/目录。
@@ -28,13 +28,16 @@ manifest 会固化：
 
 ### 准备 BUCKYOS_BUILD_ROOT
 0. 注意依赖，buckyos的local安装包依赖cyfs-gateway和BuckyOSApp,src目录结构固定。安装脚本不会去做git的任何操作
-1. cyfs-gateway 使用 `buckyos-build` / `buckyos-install` 构建，构建目录在 `BUCKYOS_ROOT`，BuckyOSApp 使用 `pnpm run tauri build` 构建，构建目录在 `$RUST_BUILD/release/bundle/...`
-2. 在本仓库内用 `uv run ./src/buckyos-build.py` 和 `uv run buckyos-install` 准备好 `BUCKYOS_BUILD_ROOT` 下的发布目录。
-3. 运行 `uv run ./src/make_config.py release --rootfs <staged_rootfs>` 生成发布配置。
+1. `cyfs-gateway` 是 `publish.*_pkg.apps.buckyos.deps` 里的打包依赖，不属于 `apps.buckyos.modules`，因此开发环境执行 devkit install 时不会触碰已有 gateway。
+2. `deps.*.source` 按 `bucky_project.yaml` 所在目录解析；`cyfs-gateway` 当前配置为 `../../cyfs-gateway/src`。
+3. prepare 阶段会对 `type: buckyos_project` 的 dep 在 `source` 目录执行 `buckyos-build` / `buckyos-install --app=<dep-name>`，安装到对应组件的 staging 目录；`--skip-prepare` 时仍要求 `source` 存在，用于生成打包 manifest。
+4. BuckyOSApp 使用 `pnpm run tauri build` 构建，构建目录在 `$RUST_BUILD/release/bundle/...`
+5. 在本仓库内用 `uv run ./src/buckyos-build.py` 和 `uv run buckyos-install` 准备好 `BUCKYOS_BUILD_ROOT` 下的发布目录。
+6. 运行 `uv run ./src/make_config.py release --rootfs <staged_rootfs>` 生成发布配置。
 ### 制作安装包
-4. 调用对应平台的 `make_local_*` 脚本执行 `build-pkg`。
-5. 如需校验，调用对应脚本的 `verify-pkg`。
-6. 版本号规则是 src/VERSION下的内容作为主版本，然后 +buildYYMMDD
+7. 调用对应平台的 `make_local_*` 脚本执行 `build-pkg`。
+8. 如需校验，调用对应脚本的 `verify-pkg`。
+9. 版本号规则是 src/VERSION下的内容作为主版本，然后 +buildYYMMDD
 
 默认 staging 根目录由 `BUCKYOS_BUILD_ROOT` 决定：
 
@@ -76,10 +79,10 @@ uv run ./src/publish/make_local_deb.py build-pkg amd64 0.5.1+build260115 \
 它会先执行 Common Flow 里的通用准备步骤：
 
 - 清理并重建 `BUCKYOS_BUILD_ROOT`
-- 构建并安装 `cyfs-gateway`、`buckycli`、`buckyos`
+- 按 `publish.*_pkg.apps.*.deps` 构建外部 `buckyos_project` 依赖，并安装到对应组件 staging 目录
+- 构建并安装 `buckycli`、`buckyos`
 - 执行 `uv run ./src/make_config.py release --rootfs <staged_rootfs>`
-- 按约定在 BuckyOS 同层目录查找并构建桌面端项目：
-  `../cyfs-gateway`、`../BuckyOSApp`
+- 按约定在 BuckyOS 同层目录查找并构建桌面端项目 `../BuckyOSApp`
 - 桌面端构建产物优先从用户环境变量 `RUST_BUILD` 读取；若未设置，则读取 `~/.cargo/config.toml` 的 `[build].target-dir`；再回退到 `/tmp/rust_build`
 - 如需覆盖默认约定，可用 `--desktop-app` 直接指定桌面端产物
 

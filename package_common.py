@@ -142,15 +142,37 @@ def source_path_for(
     source_root_override: Path | None = None,
     windows: bool = False,
 ) -> Path:
+    def with_windows_exe(path: Path) -> Path | None:
+        if not windows or path.suffix:
+            return None
+        return path.with_name(path.name + ".exe")
+
+    def existing_or_windows_exe(path: Path) -> Path | None:
+        if path.exists():
+            return path
+        exe_path = with_windows_exe(path)
+        if exe_path is not None and exe_path.exists():
+            return exe_path
+        return None
+
     override_rel = normalize_item_relpath(rel, windows=windows)
     if source_root_override is not None:
         candidate = source_root_override / override_rel
-        if candidate.exists():
-            return candidate
+        existing = existing_or_windows_exe(candidate)
+        if existing is not None:
+            return existing
     configured = item_source_paths.get(rel)
     if configured:
-        return Path(configured).resolve()
-    return source_rootfs / override_rel
+        configured_path = Path(configured).resolve()
+        existing = existing_or_windows_exe(configured_path)
+        if existing is not None:
+            return existing
+        return configured_path
+    fallback = source_rootfs / override_rel
+    existing = existing_or_windows_exe(fallback)
+    if existing is not None:
+        return existing
+    return fallback
 
 
 def normalize_payload_path(path: str) -> str:
