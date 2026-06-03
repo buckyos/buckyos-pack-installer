@@ -47,6 +47,12 @@ BUCKYOS_DEFAULTS_SUBDIR = ".buckyos_installer_defaults"
 IGNORED_STAGE_NAMES = {".DS_Store", "__pycache__"}
 WINDOWS_HOOK_EXTENSIONS = (".ps1", ".bat", ".cmd")
 WINDOWS_HOOK_STEPS = ("preinstall", "postinstall", "preuninstall")
+WINDOWS_SERVICE_SCRIPT_NAMES = (
+    "seed_defaults.ps1",
+    "ensure_firewall_rules.ps1",
+    "uninstall_cleanup.ps1",
+    "node_daemon_loader.vbs",
+)
 
 
 def yaml_load_file(path: Path) -> Dict[str, Any]:
@@ -380,6 +386,17 @@ def _copy_dir_contents(src_dir: Path, dst_dir: Path) -> None:
             shutil.copy2(child, dst)
 
 
+def _copy_windows_service_scripts(scripts_src: Path, scripts_dst: Path) -> None:
+    scripts_dst.mkdir(parents=True, exist_ok=True)
+    for script_name in WINDOWS_SERVICE_SCRIPT_NAMES:
+        src = scripts_src / script_name
+        if not src.exists():
+            continue
+        if not src.is_file():
+            raise ValueError(f"Windows service script must be a regular file: {src}")
+        shutil.copy2(src, scripts_dst / script_name)
+
+
 def _discover_windows_hook(component_key: str, step: str) -> Path | None:
     return common.discover_component_hook(
         scripts_dirs=(WIN_PKG_PROJECT_DIR / "scripts",),
@@ -499,7 +516,6 @@ def _component_expected_filenames(
                 "seed_defaults.ps1",
                 "ensure_firewall_rules.ps1",
                 "uninstall_cleanup.ps1",
-                "node_daemon_loader.ps1",
                 "node_daemon_loader.vbs",
             ],
         )
@@ -1151,18 +1167,6 @@ def generate_nsis_script(
             lines.append("  ; Allow installed service executables through Windows Firewall before first launch")
             lines.append(f'  nsExec::ExecToLog \'powershell.exe -NoProfile -ExecutionPolicy Bypass -File "${var_name}\\scripts\\ensure_firewall_rules.ps1"\'')
             lines.append("")
-            lines.append("  ; Create node_daemon keepalive scheduled task (every 1 minute) via hidden VBS wrapper")
-            lines.append('  nsExec::ExecToLog \'schtasks /Delete /TN "BuckyOSNodeDaemonKeepAlive" /F\'')
-            lines.append(
-                f'  nsExec::ExecToLog \'schtasks /Create /TN "BuckyOSNodeDaemonKeepAlive" /SC MINUTE /MO 1 /F /TR "wscript.exe //B //NoLogo $\\"${var_name}\\scripts\\node_daemon_loader.vbs$\\" $\\"${var_name}\\bin\\node-daemon\\node_daemon.exe$\\""\'' 
-            )
-            lines.append('  nsExec::ExecToLog \'schtasks /Run /TN "BuckyOSNodeDaemonKeepAlive"\'')
-            lines.append("")
-            lines.append("  ; Register current-user startup via the same hidden wrapper")
-            lines.append(
-                f'  WriteRegStr HKCU "Software\\Microsoft\\Windows\\CurrentVersion\\Run" "BuckyOSDaemon" \'wscript.exe //B //NoLogo $\\"${var_name}\\scripts\\node_daemon_loader.vbs$\\" $\\"${var_name}\\bin\\node-daemon\\node_daemon.exe$\\"\''
-            )
-            lines.append("")
             lines.append(f'  ; Save install directory to registry')
             lines.append(f'  WriteRegStr HKCU "Software\\BuckyOS" "BuckyOSUserDir" "${var_name}"')
         post_hook = _windows_payload_hook(comp_payload, "postinstall")
@@ -1224,23 +1228,10 @@ def generate_nsis_script(
         lines.append('  SetRegView 64')
     lines.append('  StrCpy $InstallerLogPath "$TEMP\\buckyos-windows-${PRODUCT_ARCH}-${PRODUCT_VERSION}-uninstall.log"')
     
-    lines.append('  ; Stop old service (for backward compatibility) and current-user daemon')
-    lines.append('  StrCpy $ExistingBuckyRoot ""')
-    lines.append('  ReadRegStr $ExistingBuckyRoot HKCU "Environment" "BUCKYOS_ROOT"')
-    lines.append('  ${If} $ExistingBuckyRoot == ""')
-    lines.append('    ReadRegStr $ExistingBuckyRoot HKCU "Software\\BuckyOS" "InstallDir"')
-    lines.append('  ${EndIf}')
+    lines.append('  ; Stop old Windows service for backward compatibility')
     lines.append('  nsExec::ExecToLog \'sc stop buckyos\'')
     lines.append("  Sleep 3000")
     lines.append('  nsExec::ExecToLog \'sc delete buckyos\'')
-    lines.append('  nsExec::ExecToLog \'schtasks /Delete /TN "BuckyOSNodeDaemonKeepAlive" /F\'')
-    lines.append('  DeleteRegValue HKCU "Software\\Microsoft\\Windows\\CurrentVersion\\Run" "BuckyOSDaemon"')
-    lines.append('  ${If} $ExistingBuckyRoot != ""')
-    lines.append('    Push $ExistingBuckyRoot')
-    lines.append('    Call un.RunStopScript')
-    lines.append('  ${Else}')
-    lines.append('    nsExec::ExecToLog \'taskkill /F /IM node_daemon.exe\'')
-    lines.append('  ${EndIf}')
     lines.append("")
     
     # Remove shortcuts for bundle components
@@ -1273,8 +1264,6 @@ def generate_nsis_script(
             lines.append(f'    nsExec::ExecToLog \'sc stop buckyos\'')
             lines.append("    Sleep 3000")
             lines.append(f'    nsExec::ExecToLog \'sc delete buckyos\'')
-            lines.append(f'    nsExec::ExecToLog \'schtasks /Delete /TN "BuckyOSNodeDaemonKeepAlive" /F\'')
-            lines.append(f'    DeleteRegValue HKCU "Software\\Microsoft\\Windows\\CurrentVersion\\Run" "BuckyOSDaemon"')
             lines.append(f'    Push ${var_name}')
             lines.append(f'    Call un.RunStopScript')
             lines.append(f'    ; Run cleanup script for service component')
@@ -1398,7 +1387,7 @@ def build_win_installer(
                 scripts_src = WIN_PKG_PROJECT_DIR / "scripts"
                 scripts_dst = comp_payload / "scripts"
                 if scripts_src.exists():
-                    _copytree_filtered(scripts_src, scripts_dst)
+                    _copy_windows_service_scripts(scripts_src, scripts_dst)
         else:
             if src.is_dir():
                 _copy_dir_contents(src, comp_payload)
@@ -1564,7 +1553,6 @@ def verify_pkg(
                     "seed_defaults.ps1",
                     "ensure_firewall_rules.ps1",
                     "uninstall_cleanup.ps1",
-                    "node_daemon_loader.ps1",
                     "node_daemon_loader.vbs",
                 ):
                     if script.lower() not in extracted_basenames:

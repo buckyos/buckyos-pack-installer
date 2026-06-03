@@ -41,8 +41,7 @@ PROJECT_YAML = SRC_DIR / "bucky_project.yaml"
 RESULT_ROOT_DIR = Path(os.environ.get("BUCKYOS_BUILD_ROOT", "/opt/buckyosci"))
 TMP_INSTALL_DIR = RESULT_ROOT_DIR / "deb-build"
 
-DEB_TEMPLATE_DIR = Path(__file__).resolve().parent / "deb_template"
-LINUX_DEB_SCRIPTS_DIR = Path(__file__).resolve().parent / "linux_deb" / "scripts"
+DEB_PKG_DIR = Path(__file__).resolve().parent / "deb_pkg"
 BUCKYOS_DEFAULTS_SUBDIR = ".buckyos_installer_defaults"
 IGNORED_STAGE_NAMES = {".DS_Store", "__pycache__"}
 
@@ -273,12 +272,12 @@ def _normalize_deb_arch(arch: str) -> str:
     return common.canonical_arch(arch)
 
 
-def _adjust_control_file(dest_dir: Path, new_version: str, architecture: str) -> None:
-    control_file = dest_dir / "DEBIAN" / "control"
+def _render_control_file(*, new_version: str, architecture: str) -> str:
+    control_file = DEB_PKG_DIR / "control"
     content = control_file.read_text(encoding="utf-8")
     content = content.replace("{{package version here}}", new_version)
     content = content.replace("{{architecture}}", _normalize_deb_arch(architecture))
-    control_file.write_text(content, encoding="utf-8")
+    return content
 
 
 AUTO_BEGIN = "# BEGIN AUTO-GENERATED:"
@@ -353,20 +352,39 @@ def _linux_component_keys(project_yaml_path: Path, manifest_path: Path | None) -
 
 def _discover_linux_hook(component_key: str, step: str) -> Path | None:
     return common.discover_component_hook(
-        scripts_dirs=(LINUX_DEB_SCRIPTS_DIR, DEB_TEMPLATE_DIR / "DEBIAN"),
+        scripts_dirs=(DEB_PKG_DIR,),
         component_key=component_key,
         step=step,
         extensions=("", ".sh"),
     )
 
 
-def _shell_hook_lines(component_keys: List[str], step: str) -> List[str]:
+def _render_linux_hook_text(*, hook_path: Path, component_key: str, step: str, layout: AppLayout) -> str:
+    hook_text = hook_path.read_text(encoding="utf-8", errors="ignore")
+    if component_key == "buckyos" and step == "preinstall":
+        hook_text = _replace_marked_block(hook_text, "modules", _rm_lines("$BUCKYOS_ROOT", layout.module_paths))
+    if component_key == "buckyos" and step == "postinstall":
+        hook_text = _replace_marked_block(
+            hook_text,
+            "data_paths",
+            _data_copy_lines("$BUCKYOS_ROOT", "$DEFAULTS_DIR", layout.data_paths),
+            indent="  ",
+        )
+    return hook_text.rstrip("\n")
+
+
+def _shell_hook_lines(component_keys: List[str], step: str, *, layout: AppLayout) -> List[str]:
     out: List[str] = []
     for component_key in component_keys:
         hook_path = _discover_linux_hook(component_key, step)
         if hook_path is None:
             continue
-        hook_text = hook_path.read_text(encoding="utf-8")
+        hook_text = _render_linux_hook_text(
+            hook_path=hook_path,
+            component_key=component_key,
+            step=step,
+            layout=layout,
+        )
         out.extend(
             [
                 f'echo "[buckyos] running {component_key}_{step} hook"',
@@ -384,19 +402,28 @@ def _shell_hook_lines(component_keys: List[str], step: str) -> List[str]:
     return out or [":"]
 
 
-def sync_deb_scripts(
+def _render_deb_maintainer_script(*, step: str, component_keys: List[str], layout: AppLayout) -> str:
+    block_name = f"component_{step}_hooks"
+    lines = [
+        "#!/bin/bash",
+        "set -e",
+        f"# BEGIN AUTO-GENERATED: {block_name}",
+        *_shell_hook_lines(component_keys, step, layout=layout),
+        f"# END AUTO-GENERATED: {block_name}",
+    ]
+    return "\n".join(lines).rstrip("\n") + "\n"
+
+
+def materialize_deb_control_dir(
     project_yaml_path: Path,
-    scripts_dir: Path,
+    debian_dir: Path,
     *,
+    version: str,
+    architecture: str,
     manifest_path: Path | None = None,
 ) -> None:
     """
-    Update debian maintainer scripts based on bucky_project.yaml.
-
-    Only updates sections wrapped by markers:
-      # BEGIN AUTO-GENERATED: <name>
-      ...
-      # END AUTO-GENERATED: <name>
+    Render DEBIAN/control, preinst and postinst from deb_pkg sources.
     """
     layout = resolve_app_layout(
         app_key="buckyos",
@@ -405,32 +432,19 @@ def sync_deb_scripts(
     )
     component_keys = _linux_component_keys(project_yaml_path, manifest_path)
 
-    preinst = scripts_dir / "preinst"
-    if preinst.exists():
-        txt = preinst.read_text(encoding="utf-8", errors="ignore")
-        txt = _replace_marked_block(
-            txt,
-            "component_preinstall_hooks",
-            _shell_hook_lines(component_keys, "preinstall"),
-        )
-        txt = _replace_marked_block(txt, "modules", _rm_lines("$BUCKYOS_ROOT", layout.module_paths))
-        preinst.write_text(txt.rstrip("\n") + "\n", encoding="utf-8")
-
-    postinst = scripts_dir / "postinst"
-    if postinst.exists():
-        txt = postinst.read_text(encoding="utf-8", errors="ignore")
-        txt = _replace_marked_block(
-            txt,
-            "data_paths",
-            _data_copy_lines("$BUCKYOS_ROOT", "$DEFAULTS_DIR", layout.data_paths),
-            indent="  ",
-        )
-        txt = _replace_marked_block(
-            txt,
-            "component_postinstall_hooks",
-            _shell_hook_lines(component_keys, "postinstall"),
-        )
-        postinst.write_text(txt.rstrip("\n") + "\n", encoding="utf-8")
+    debian_dir.mkdir(parents=True, exist_ok=True)
+    (debian_dir / "control").write_text(
+        _render_control_file(new_version=version, architecture=architecture),
+        encoding="utf-8",
+    )
+    (debian_dir / "preinst").write_text(
+        _render_deb_maintainer_script(step="preinstall", component_keys=component_keys, layout=layout),
+        encoding="utf-8",
+    )
+    (debian_dir / "postinst").write_text(
+        _render_deb_maintainer_script(step="postinstall", component_keys=component_keys, layout=layout),
+        encoding="utf-8",
+    )
 
 
 def _resolve_buckyos_src(
@@ -477,16 +491,16 @@ def build_deb(
         shutil.rmtree(deb_dir, ignore_errors=True)
 
     if dry_run:
-        print(f"[dry-run] copy template: {DEB_TEMPLATE_DIR} -> {deb_dir}")
+        print(f"[dry-run] materialize deb control scripts: {DEB_PKG_DIR} -> {deb_dir / 'DEBIAN'}")
     else:
-        shutil.copytree(DEB_TEMPLATE_DIR, deb_dir, dirs_exist_ok=True)
-
-    # Keep copied maintainer scripts in sync with bucky_project.yaml without mutating repo files.
-    if (not dry_run) and (not bool(os.environ.get("BUCKYOS_PKG_NO_SYNC_SCRIPTS"))):
-        sync_deb_scripts(project_yaml_path, deb_dir / "DEBIAN", manifest_path=manifest_path)
-
-    if not dry_run:
-        _adjust_control_file(deb_dir, version, deb_arch)
+        deb_dir.mkdir(parents=True, exist_ok=True)
+        materialize_deb_control_dir(
+            project_yaml_path,
+            deb_dir / "DEBIAN",
+            version=version,
+            architecture=deb_arch,
+            manifest_path=manifest_path,
+        )
 
     payload_root = deb_dir / "opt" / "buckyos"
     layout = resolve_app_layout(
@@ -915,7 +929,7 @@ def action_uninstall(layout: AppLayout, dry_run: bool = False) -> None:
 def _legacy_build_main(argv: List[str]) -> int:
     # Backward compatibility:
     #   python make_local_deb.py <architecture> <version>
-    subcommands = {"build-pkg", "install", "update", "uninstall"}
+    subcommands = {"build-pkg", "render-control", "install", "update", "uninstall"}
     if len(argv) == 3 and (argv[1] not in subcommands) and (not argv[1].startswith("-")):
         architecture = argv[1]
         version = argv[2]
@@ -959,16 +973,22 @@ def main(argv: List[str]) -> int:
         help='Output directory for the final .deb (default: "./publish")',
     )
     p_build.add_argument(
-        "--no-sync-scripts",
-        action="store_true",
-        help="Do not auto-sync deb_template/DEBIAN scripts from bucky_project.yaml before build",
-    )
-    p_build.add_argument(
         "--source-rootfs",
         default=None,
         help="Override source rootfs path for buckyos payload",
     )
     p_build.add_argument("--dry-run", action="store_true", help="Print commands without executing them")
+
+    p_render = sub.add_parser("render-control", help="Render final DEBIAN/control, preinst and postinst files")
+    p_render.add_argument("architecture", help="amd64|arm64 (x86_64 accepted)")
+    p_render.add_argument("version", help="Version string")
+    p_render.add_argument("--project", default=str(PROJECT_YAML), help="Path to bucky_project.yaml")
+    p_render.add_argument("--manifest", default=None, help="Path to generated project manifest JSON")
+    p_render.add_argument(
+        "--out-dir",
+        required=True,
+        help="Directory to write control, preinst and postinst into",
+    )
 
     p_verify = sub.add_parser("verify-pkg", help="Verify a built Debian .deb offline (no install)")
     p_verify.add_argument("pkg", help="Path to .deb")
@@ -989,8 +1009,6 @@ def main(argv: List[str]) -> int:
         arch = args.architecture
         if arch == "x86_64":
             arch = "amd64"
-        if args.no_sync_scripts:
-            os.environ["BUCKYOS_PKG_NO_SYNC_SCRIPTS"] = "1"
         out_deb = build_deb(
             architecture=arch,
             version=args.version,
@@ -1002,6 +1020,25 @@ def main(argv: List[str]) -> int:
             dry_run=bool(args.dry_run),
         )
         print(f"deb built: {out_deb}")
+        return 0
+
+    if args.cmd == "render-control":
+        arch = args.architecture
+        if arch == "x86_64":
+            arch = "amd64"
+        out_dir = Path(args.out_dir)
+        materialize_deb_control_dir(
+            Path(args.project),
+            out_dir,
+            version=args.version,
+            architecture=arch,
+            manifest_path=Path(args.manifest).resolve() if args.manifest else None,
+        )
+        for script_name in ("preinst", "postinst"):
+            script_path = out_dir / script_name
+            if script_path.exists():
+                script_path.chmod(0o755)
+        print(f"deb control files rendered: {out_dir}")
         return 0
 
     if args.cmd == "verify-pkg":

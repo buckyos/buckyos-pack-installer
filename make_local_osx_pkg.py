@@ -492,7 +492,7 @@ def build_macos_distribution_pkg(
 
     # Keep project scripts in sync with bucky_project.yaml before building.
     # This updates only marked AUTO-GENERATED blocks in existing scripts.
-    if (not dry_run) and (not bool(os.environ.get("BUCKYOS_PKG_NO_SYNC_SCRIPTS"))):
+    if not dry_run:
         sync_macos_scripts(project_yaml_path, resources_dir / "scripts", manifest_path=manifest_path)
 
     if work_dir.exists() and not dry_run:
@@ -1286,11 +1286,6 @@ def main(argv: List[str]) -> int:
         default=str(Path.cwd() / "publish"),
         help='Output directory for the final .pkg (default: "./publish")',
     )
-    p_build.add_argument(
-        "--no-sync-scripts",
-        action="store_true",
-        help="Do not auto-sync publish/macos_pkg/scripts from bucky_project.yaml before build",
-    )
     p_build.add_argument("--dry-run", action="store_true", help="Print commands without executing them")
 
     p_sync = sub.add_parser("sync-macos-scripts", help="Regenerate macos_pkg preinstall/postinstall from bucky_project.yaml")
@@ -1318,8 +1313,6 @@ def main(argv: List[str]) -> int:
             arch = "amd64"
         if arch == "aarch64":
             arch = "arm64"
-        if args.no_sync_scripts:
-            os.environ["BUCKYOS_PKG_NO_SYNC_SCRIPTS"] = "1"
         out_pkg = build_macos_distribution_pkg(
             architecture=arch,
             version=args.version,
