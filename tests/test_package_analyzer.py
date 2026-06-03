@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import contextlib
+import gzip
 import io
 import json
+import shutil
 import subprocess
 import tempfile
 import unittest
@@ -143,6 +145,9 @@ class PackageAnalyzerTests(unittest.TestCase):
         self.assertIn("xar", tools)
         self.assertIn("cpio", tools)
         self.assertIn("7z", tools)
+        self.assertIn("gzip", tools)
+        self.assertIn("xz", tools)
+        self.assertIn("zstd", tools)
         self.assertNotIn("pkgutil", tools)
 
     def test_missing_tools_error_includes_apt_hint(self) -> None:
@@ -153,6 +158,34 @@ class PackageAnalyzerTests(unittest.TestCase):
         self.assertIn("7z (apt package: 7zip)", message)
         self.assertIn("sudo apt install -y", message)
         self.assertIn("p7zip-full", message)
+
+    @unittest.skipIf(shutil.which("cpio") is None, "cpio is required")
+    def test_extract_payload_cpio_handles_gzip_payload(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            src = root / "src"
+            out = root / "out"
+            src.mkdir()
+            out.mkdir()
+            (src / "hello.txt").write_text("hello\n", encoding="utf-8")
+            archive = subprocess.run(
+                ["cpio", "-o", "--format=newc"],
+                cwd=src,
+                input=b"hello.txt\n",
+                capture_output=True,
+                check=True,
+            )
+            payload = root / "Payload"
+            payload.write_bytes(gzip.compress(archive.stdout))
+            tools = {
+                "cpio": package_analyzer.ToolStatus(name="cpio", path=shutil.which("cpio")),
+                "gzip": package_analyzer.ToolStatus(name="gzip", path=shutil.which("gzip")),
+            }
+
+            rc, detail = package_analyzer.extract_payload_cpio(payload, out, tools=tools)
+
+            self.assertEqual((rc, detail), (0, ""))
+            self.assertEqual((out / "hello.txt").read_text(encoding="utf-8"), "hello\n")
 
     def test_pkg_xar_expands_nested_flat_component_package(self) -> None:
         with tempfile.TemporaryDirectory() as td:
@@ -215,6 +248,59 @@ class PackageAnalyzerTests(unittest.TestCase):
         self.assertIn("Payload", package_files)
         payload_files = {entry["path"] for entry in components[0]["payload"]["files"]}
         self.assertIn("opt/buckyos/ood-daemon", payload_files)
+        installer_scripts = record["analysis"]["installer_scripts"]
+        self.assertTrue(any(script["name"] == "postinstall" for script in installer_scripts))
+
+    @unittest.skipIf(shutil.which("cpio") is None, "cpio is required")
+    def test_pkg_xar_extracts_gzip_scripts_archive(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            package = root / "buckyos-apple-aarch64-0.6.0+build260603.pkg"
+            package.write_bytes(b"outer pkg")
+            script_src = root / "script-src"
+            script_src.mkdir()
+            (script_src / "postinstall").write_text("#!/bin/zsh\necho installed\n", encoding="utf-8")
+            archive = subprocess.run(
+                ["cpio", "-o", "--format=newc"],
+                cwd=script_src,
+                input=b"postinstall\n",
+                capture_output=True,
+                check=True,
+            )
+            scripts_archive = gzip.compress(archive.stdout)
+            original_run_capture = package_analyzer.run_capture
+
+            def fake_run_capture(cmd: list[str], *, check: bool = True) -> subprocess.CompletedProcess[str]:
+                out_dir = Path(cmd[cmd.index("-C") + 1])
+                comp_dir = out_dir / "buckycli.pkg"
+                comp_dir.mkdir()
+                (comp_dir / "PackageInfo").write_text(
+                    '<pkg-info identifier="ai.buckyos.buckycli" version="0.6.0"/>',
+                    encoding="utf-8",
+                )
+                (comp_dir / "Scripts").write_bytes(scripts_archive)
+                return subprocess.CompletedProcess(cmd, 0, "", "")
+
+            try:
+                package_analyzer.run_capture = fake_run_capture
+                record = package_analyzer.base_package_record(package, include_hashes=False)
+                package_analyzer.analyze_pkg_with_xar(
+                    package,
+                    record,
+                    tools={
+                        "cpio": package_analyzer.ToolStatus(name="cpio", path=shutil.which("cpio")),
+                        "gzip": package_analyzer.ToolStatus(name="gzip", path=shutil.which("gzip")),
+                    },
+                    include_hashes=False,
+                    script_text_limit=1024,
+                )
+            finally:
+                package_analyzer.run_capture = original_run_capture
+
+        comp = record["analysis"]["components"][0]
+        self.assertEqual(comp["scripts_compression"], "gzip")
+        self.assertIn("postinstall", comp["scripts"])
+        self.assertIn("echo installed", comp["scripts"]["postinstall"]["text"])
         installer_scripts = record["analysis"]["installer_scripts"]
         self.assertTrue(any(script["name"] == "postinstall" for script in installer_scripts))
 

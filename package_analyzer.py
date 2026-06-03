@@ -5,7 +5,6 @@ from __future__ import annotations
 
 import argparse
 import datetime as dt
-import gzip
 import hashlib
 import json
 import os
@@ -54,17 +53,22 @@ INSTALLER_SCRIPT_NAMES = {
 HASH_CHUNK_SIZE = 1024 * 1024
 DEFAULT_CI_CONFIG = Path("/root/work/pve-pack-system/config/pve-build.toml")
 WINDOWS_NSIS_RELATIVE_PATH = "win-installer/distbuild/installer.nsi"
-LINUX_REQUIRED_TOOLS = ("7z", "cpio", "dpkg-deb", "rpm", "rpm2cpio", "xar")
+PROCESS_DETAIL_LIMIT = 8192
+LINUX_REQUIRED_TOOLS = ("7z", "bzip2", "cpio", "dpkg-deb", "gzip", "rpm", "rpm2cpio", "xar", "xz", "zstd")
 OPTIONAL_TOOL_PACKAGES = {
     "ssh": "openssh-client",
 }
 APT_PACKAGE_BY_TOOL = {
     "7z": "7zip",
+    "bzip2": "bzip2",
     "cpio": "cpio",
     "dpkg-deb": "dpkg",
+    "gzip": "gzip",
     "rpm": "rpm",
     "rpm2cpio": "rpm2cpio",
     "xar": "xar",
+    "xz": "xz-utils",
+    "zstd": "zstd",
     **OPTIONAL_TOOL_PACKAGES,
 }
 APT_TOOL_NOTES = {
@@ -200,6 +204,14 @@ def run_capture(cmd: list[str], *, check: bool = True) -> subprocess.CompletedPr
 
 def run_bytes(cmd: list[str], *, check: bool = True) -> subprocess.CompletedProcess[bytes]:
     return subprocess.run(cmd, check=check, capture_output=True)
+
+
+def limit_process_detail(detail: str) -> str:
+    detail = detail.strip()
+    if len(detail) <= PROCESS_DETAIL_LIMIT:
+        return detail
+    omitted = len(detail) - PROCESS_DETAIL_LIMIT
+    return f"{detail[:PROCESS_DETAIL_LIMIT]}\n... truncated {omitted} chars"
 
 
 def ps_single_quote(value: str) -> str:
@@ -529,7 +541,7 @@ def extract_rpm_payload(path: Path, out_dir: Path) -> tuple[int, str]:
     rpm2cpio = subprocess.Popen(["rpm2cpio", str(path)], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     assert rpm2cpio.stdout is not None
     cpio = subprocess.run(
-        ["cpio", "-idm", "--quiet"],
+        ["cpio", "-idm", "--quiet", "--no-preserve-owner"],
         cwd=out_dir,
         stdin=rpm2cpio.stdout,
         capture_output=True,
@@ -540,9 +552,9 @@ def extract_rpm_payload(path: Path, out_dir: Path) -> tuple[int, str]:
     rpm2cpio.stdout.close()
     _, rpm2cpio_err = rpm2cpio.communicate()
     if rpm2cpio.returncode != 0:
-        return rpm2cpio.returncode or 1, rpm2cpio_err.decode("utf-8", errors="replace").strip()
+        return rpm2cpio.returncode or 1, limit_process_detail(rpm2cpio_err.decode("utf-8", errors="replace"))
     if cpio.returncode != 0:
-        return cpio.returncode, cpio.stderr.strip()
+        return cpio.returncode, limit_process_detail(cpio.stderr)
     return 0, ""
 
 
@@ -608,35 +620,77 @@ def analyze_rpm(
             }
 
 
+def detect_payload_compression(payload_path: Path) -> str:
+    with payload_path.open("rb") as f:
+        magic = f.read(8)
+    if magic.startswith(b"\x1f\x8b"):
+        return "gzip"
+    if magic.startswith(b"\xfd7zXZ\x00"):
+        return "xz"
+    if magic.startswith(b"BZh"):
+        return "bzip2"
+    if magic.startswith(b"\x28\xb5\x2f\xfd"):
+        return "zstd"
+    return "raw"
+
+
+def payload_decompress_command(compression: str, payload_path: Path) -> list[str] | None:
+    commands = {
+        "gzip": ["gzip", "-dc", str(payload_path)],
+        "xz": ["xz", "-dc", str(payload_path)],
+        "bzip2": ["bzip2", "-dc", str(payload_path)],
+        "zstd": ["zstd", "-dcq", str(payload_path)],
+    }
+    return commands.get(compression)
+
+
+def run_cpio_extract(
+    out_dir: Path,
+    *,
+    stdin: Any,
+) -> tuple[int, str]:
+    cpio = subprocess.run(
+        ["cpio", "-idm", "--quiet", "--no-preserve-owner"],
+        cwd=out_dir,
+        stdin=stdin,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+    )
+    if cpio.returncode != 0:
+        return cpio.returncode, limit_process_detail(cpio.stderr)
+    return 0, ""
+
+
 def extract_payload_cpio(payload_path: Path, out_dir: Path, *, tools: dict[str, ToolStatus]) -> tuple[int, str]:
     if not tools["cpio"].available:
         return 1, "missing cpio"
-    with payload_path.open("rb") as f:
-        magic = f.read(2)
-    if magic == b"\x1f\x8b":
-        with gzip.open(payload_path, "rb") as gz:
-            cpio = subprocess.run(
-                ["cpio", "-idm", "--quiet"],
-                cwd=out_dir,
-                stdin=gz,
-                capture_output=True,
-                text=True,
-                encoding="utf-8",
-                errors="replace",
-            )
-    else:
+
+    compression = detect_payload_compression(payload_path)
+    decompress_cmd = payload_decompress_command(compression, payload_path)
+    if decompress_cmd is None:
         with payload_path.open("rb") as raw:
-            cpio = subprocess.run(
-                ["cpio", "-idm", "--quiet"],
-                cwd=out_dir,
-                stdin=raw,
-                capture_output=True,
-                text=True,
-                encoding="utf-8",
-                errors="replace",
-            )
-    if cpio.returncode != 0:
-        return cpio.returncode, cpio.stderr.strip()
+            return run_cpio_extract(out_dir, stdin=raw)
+
+    tool_name = decompress_cmd[0]
+    tool_status = tools.get(tool_name) or which(tool_name)
+    if not tool_status.available:
+        return 1, f"missing {tool_name}"
+
+    decompressor = subprocess.Popen(decompress_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    assert decompressor.stdout is not None
+    rc, detail = run_cpio_extract(out_dir, stdin=decompressor.stdout)
+    decompressor.stdout.close()
+    _, decompressor_err = decompressor.communicate()
+    decompressor_detail = limit_process_detail(decompressor_err.decode("utf-8", errors="replace"))
+    if rc != 0:
+        if decompressor.returncode != 0 and decompressor_detail:
+            detail = f"{detail}\n{tool_name}: {decompressor_detail}" if detail else decompressor_detail
+        return rc, detail
+    if decompressor.returncode != 0:
+        detail = f"{tool_name} failed: {decompressor_detail}" if decompressor_detail else f"{tool_name} failed"
+        return decompressor.returncode or 1, detail
     return 0, ""
 
 
@@ -719,16 +773,35 @@ def analyze_pkg_with_xar(
                 comp["package_info"] = parse_package_info(package_info)
             scripts_dir = comp_dir / "Scripts"
             if scripts_dir.exists():
-                comp_scripts = collect_scripts(scripts_dir, limit_bytes=script_text_limit)
-                comp["scripts"] = comp_scripts
-                append_installer_scripts_from_mapping(
-                    record,
-                    comp_scripts,
-                    kind="macos-component-script",
-                    source=f"pkg-xar:{comp_name}/Scripts",
-                )
+                if scripts_dir.is_dir():
+                    comp_scripts = collect_scripts(scripts_dir, limit_bytes=script_text_limit)
+                    comp["scripts"] = comp_scripts
+                    append_installer_scripts_from_mapping(
+                        record,
+                        comp_scripts,
+                        kind="macos-component-script",
+                        source=f"pkg-xar:{comp_name}/Scripts",
+                    )
+                elif scripts_dir.is_file():
+                    comp["scripts_compression"] = detect_payload_compression(scripts_dir)
+                    scripts_root = Path(td) / "scripts" / comp_name
+                    scripts_root.mkdir(parents=True)
+                    rc, detail = extract_payload_cpio(scripts_dir, scripts_root, tools=tools)
+                    if rc != 0:
+                        comp["scripts_error"] = detail or "Scripts extraction failed"
+                    else:
+                        comp["script_files"] = tree_entries(scripts_root, include_hashes=include_hashes)
+                        comp_scripts = collect_scripts(scripts_root, limit_bytes=script_text_limit)
+                        comp["scripts"] = comp_scripts
+                        append_installer_scripts_from_mapping(
+                            record,
+                            comp_scripts,
+                            kind="macos-component-script",
+                            source=f"pkg-xar:{comp_name}/Scripts",
+                        )
             payload = comp_dir / "Payload"
             if payload.exists():
+                comp["payload_compression"] = detect_payload_compression(payload)
                 payload_root = Path(td) / "payloads" / comp_name
                 payload_root.mkdir(parents=True)
                 rc, detail = extract_payload_cpio(payload, payload_root, tools=tools)

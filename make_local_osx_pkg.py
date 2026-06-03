@@ -332,8 +332,6 @@ def _resolve_component_target(component: PublishComponent) -> Path:
 
 
 def _resolve_component_pkg_target(component: PublishComponent) -> Path:
-    if component.key == "buckycli":
-        return Path("/Library/Application Support/BuckyOS/buckycli")
     return _resolve_component_target(component)
 
 
