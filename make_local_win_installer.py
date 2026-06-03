@@ -46,7 +46,7 @@ WIN_PKG_PROJECT_DIR = SRC_DIR / "publish" / "win_pkg"
 BUCKYOS_DEFAULTS_SUBDIR = ".buckyos_installer_defaults"
 IGNORED_STAGE_NAMES = {".DS_Store", "__pycache__"}
 WINDOWS_HOOK_EXTENSIONS = (".ps1", ".bat", ".cmd")
-WINDOWS_HOOK_STEPS = ("preinstall", "postinstall")
+WINDOWS_HOOK_STEPS = ("preinstall", "postinstall", "preuninstall")
 
 
 def yaml_load_file(path: Path) -> Dict[str, Any]:
@@ -410,7 +410,8 @@ def _windows_payload_hook(comp_payload: Path, step: str) -> Path | None:
 
 
 def _hook_exec_command(var_name: str, hook_rel: str) -> str:
-    hook_path = f"${var_name}\\{hook_rel}"
+    var_ref = var_name if var_name.startswith("$") else f"${var_name}"
+    hook_path = f"{var_ref}\\{hook_rel}"
     suffix = Path(hook_rel).suffix.lower()
     if suffix == ".ps1":
         return f'powershell.exe -NoProfile -ExecutionPolicy Bypass -File "{hook_path}"'
@@ -427,7 +428,7 @@ def _append_windows_hook_call(
     hook_rel: str,
     step: str,
 ) -> None:
-    error_code = "50" if step == "preinstall" else "70"
+    error_code = {"preinstall": "50", "postinstall": "70", "preuninstall": "80"}.get(step, "70")
     label = f"{_sanitize_id(comp_key).replace('-', '_')}_{step}"
     hook_cmd = _hook_exec_command(var_name, hook_rel)
     lines.append(f"  ; Run {comp_key} {step} hook")
@@ -565,6 +566,12 @@ def _stage_buckyos_app_root(*, src_root: Path, dst_root: Path, layout: AppLayout
         if s.is_dir():
             _copytree_filtered(s, d)
         else:
+            if (
+                s.suffix.lower() == ".exe"
+                and not d.suffix
+                and s.name.lower() == f"{d.name}.exe".lower()
+            ):
+                d = d.with_name(s.name)
             d.parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(s, d)
 
@@ -1158,16 +1165,6 @@ def generate_nsis_script(
             lines.append("")
             lines.append(f'  ; Save install directory to registry')
             lines.append(f'  WriteRegStr HKCU "Software\\BuckyOS" "BuckyOSUserDir" "${var_name}"')
-        elif comp.key == "buckycli":
-            lines.append("")
-            lines.append("  ; Add buckycli directory to the current user's PATH")
-            lines.append('  ReadRegStr $0 HKCU "Environment" "Path"')
-            lines.append('  ${If} $0 == ""')
-            lines.append(f'    WriteRegExpandStr HKCU "Environment" "Path" "${var_name}"')
-            lines.append("  ${Else}")
-            lines.append(f'    WriteRegExpandStr HKCU "Environment" "Path" "$0;${var_name}"')
-            lines.append("  ${EndIf}")
-            lines.append('  SendMessage ${HWND_BROADCAST} ${WM_WININICHANGE} 0 "STR:Environment" /TIMEOUT=5000')
         post_hook = _windows_payload_hook(comp_payload, "postinstall")
         if post_hook is not None:
             _append_windows_hook_call(
@@ -1177,6 +1174,8 @@ def generate_nsis_script(
                 hook_rel=post_hook.relative_to(comp_payload).as_posix().replace("/", "\\"),
                 step="postinstall",
             )
+            if comp.key == "buckycli":
+                lines.append('  SendMessage ${HWND_BROADCAST} ${WM_WININICHANGE} 0 "STR:Environment" /TIMEOUT=5000')
         
         # Save each component's install directory to registry for uninstall
         lines.append(f'  WriteRegStr HKCU "Software\\BuckyOS" "InstDir_{comp.key}" "${var_name}"')
@@ -1223,6 +1222,7 @@ def generate_nsis_script(
     # Add 64-bit registry view for uninstaller
     if nsis_arch == "x64":
         lines.append('  SetRegView 64')
+    lines.append('  StrCpy $InstallerLogPath "$TEMP\\buckyos-windows-${PRODUCT_ARCH}-${PRODUCT_VERSION}-uninstall.log"')
     
     lines.append('  ; Stop old service (for backward compatibility) and current-user daemon')
     lines.append('  StrCpy $ExistingBuckyRoot ""')
@@ -1256,8 +1256,18 @@ def generate_nsis_script(
     lines.append('  ; Read install directories from registry and remove files')
     for comp in components:
         var_name = f"InstDir_{_sanitize_id(comp.key).replace('-', '_')}"
-        lines.append(f'  ReadRegStr $0 HKCU "Software\\BuckyOS" "InstDir_{comp.key}"')
-        lines.append(f'  ${{If}} $0 != ""')
+        comp_payload = payload_dir / comp.key
+        lines.append(f'  ReadRegStr ${var_name} HKCU "Software\\BuckyOS" "InstDir_{comp.key}"')
+        lines.append(f'  ${{If}} ${var_name} != ""')
+        preuninstall_hook = _windows_payload_hook(comp_payload, "preuninstall")
+        if preuninstall_hook is not None:
+            _append_windows_hook_call(
+                lines,
+                comp_key=comp.key,
+                var_name=var_name,
+                hook_rel=preuninstall_hook.relative_to(comp_payload).as_posix().replace("/", "\\"),
+                step="preuninstall",
+            )
         if comp.system_service:
             lines.append(f'    ; Stop running processes and old service for service component')
             lines.append(f'    nsExec::ExecToLog \'sc stop buckyos\'')
@@ -1265,17 +1275,17 @@ def generate_nsis_script(
             lines.append(f'    nsExec::ExecToLog \'sc delete buckyos\'')
             lines.append(f'    nsExec::ExecToLog \'schtasks /Delete /TN "BuckyOSNodeDaemonKeepAlive" /F\'')
             lines.append(f'    DeleteRegValue HKCU "Software\\Microsoft\\Windows\\CurrentVersion\\Run" "BuckyOSDaemon"')
-            lines.append(f'    Push $0')
+            lines.append(f'    Push ${var_name}')
             lines.append(f'    Call un.RunStopScript')
             lines.append(f'    ; Run cleanup script for service component')
-            lines.append(f'    nsExec::ExecToLog \'powershell.exe -ExecutionPolicy Bypass -File "$0\\scripts\\uninstall_cleanup.ps1"\'')
-            lines.append(f'    RMDir /r "$0\\.buckyos_installer_defaults"')
-            lines.append(f'    RMDir /r "$0\\scripts"')
+            lines.append(f'    nsExec::ExecToLog \'powershell.exe -ExecutionPolicy Bypass -File "${var_name}\\scripts\\uninstall_cleanup.ps1"\'')
+            lines.append(f'    RMDir /r "${var_name}\\.buckyos_installer_defaults"')
+            lines.append(f'    RMDir /r "${var_name}\\scripts"')
             lines.append('    MessageBox MB_YESNO|MB_ICONQUESTION "Do you want to delete your data and identity?" IDYES +2')
             lines.append("    Goto +2")
-            lines.append(f'    RMDir /r "$0"')
+            lines.append(f'    RMDir /r "${var_name}"')
         else:
-            lines.append(f'    RMDir /r "$0"')
+            lines.append(f'    RMDir /r "${var_name}"')
         lines.append(f'  ${{EndIf}}')
         lines.append("")
     
