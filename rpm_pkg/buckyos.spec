@@ -5,7 +5,6 @@ Release: {{rpm_release}}
 Summary: BuckyOS system software
 License: Proprietary
 URL: https://buckyos.org
-BuildArch: {{rpm_architecture}}
 AutoReqProv: no
 
 Requires: python3
