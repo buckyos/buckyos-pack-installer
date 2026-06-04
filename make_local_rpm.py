@@ -525,29 +525,6 @@ def _verify_expected_linux_hooks(
             failures.append(f"{package_kind} {step} script missing expected component hook: {hook_path}")
 
 
-def _service_unit() -> str:
-    return """[Unit]
-Description=buckyos node daemon
-After=network.target
-
-[Service]
-ExecStart=/opt/buckyos/bin/node-daemon/node_daemon --enable_active
-User=root
-WorkingDirectory=/opt/buckyos/bin
-Restart=always
-
-[Install]
-WantedBy=multi-user.target
-"""
-
-
-def _write_service_file(payload_tree: Path) -> None:
-    service_path = payload_tree / "etc" / "systemd" / "system" / "buckyos.service"
-    service_path.parent.mkdir(parents=True, exist_ok=True)
-    service_path.write_text(_service_unit(), encoding="utf-8")
-    service_path.chmod(0o644)
-
-
 def _scriptlet(lines: List[str]) -> str:
     return "\n".join(lines).rstrip("\n") + "\n"
 
@@ -566,7 +543,6 @@ def _render_spec(
     *,
     rpm_version: str,
     rpm_release: str,
-    rpm_architecture: str,
     payload_tree: Path,
     layout: AppLayout,
     component_keys: List[str],
@@ -600,7 +576,6 @@ def _render_spec(
         {
             "rpm_version": rpm_version,
             "rpm_release": rpm_release,
-            "rpm_architecture": rpm_architecture,
             "payload_tree": payload_arg,
             "pre_script": _scriptlet(pre_lines),
             "post_script": _scriptlet(post_lines),
@@ -659,24 +634,18 @@ def build_rpm(
     component_keys = _linux_component_keys(project_yaml_path, manifest_path)
 
     if dry_run:
-        print(f"[dry-run] rpm Version={rpm_version} Release={rpm_release} BuildArch={rpm_architecture}")
+        print(f"[dry-run] rpm Version={rpm_version} Release={rpm_release} TargetArch={rpm_architecture}")
         print(f"[dry-run] stage buckyos: {src_root} -> {payload_root}")
-        print(f"[dry-run] write service: {payload_tree / 'etc/systemd/system/buckyos.service'}")
     else:
         for subdir in ("BUILD", "RPMS", "SOURCES", "SPECS", "SRPMS", "BUILDROOT"):
             (rpmbuild_root / subdir).mkdir(parents=True, exist_ok=True)
         payload_root.mkdir(parents=True, exist_ok=True)
         _stage_buckyos_app_root(src_root=src_root, dst_root=payload_root, layout=layout)
-        _write_service_file(payload_tree)
         _normalize_tree_modes(payload_tree / "opt")
-        (payload_tree / "etc").chmod(0o755)
-        (payload_tree / "etc" / "systemd").chmod(0o755)
-        (payload_tree / "etc" / "systemd" / "system").chmod(0o755)
 
     spec_text = _render_spec(
         rpm_version=rpm_version,
         rpm_release=rpm_release,
-        rpm_architecture=rpm_architecture,
         payload_tree=payload_tree,
         layout=layout,
         component_keys=component_keys,
@@ -785,7 +754,7 @@ def verify_pkg(
                 layout=layout,
                 failures=failures,
                 package_kind="rpm",
-                include_systemd_service=True,
+                include_systemd_service=False,
             )
         except subprocess.CalledProcessError as err:
             failures.append(err.stderr.strip() or "rpm payload listing failed")

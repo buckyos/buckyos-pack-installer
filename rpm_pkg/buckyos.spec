@@ -14,6 +14,8 @@ Requires: psmisc
 Requires: (moby-engine or docker-ce or docker-engine)
 
 %global debug_package %{nil}
+# Keep prebuilt payload files unchanged after %install.
+%global __os_install_post %{nil}
 
 %description
 BuckyOS system software, including node_daemon, node_active, cyfs_gateway,
@@ -39,4 +41,3 @@ cp -a {{payload_tree}}/. "%{buildroot}/"
 %files
 %defattr(-,root,root,-)
 /opt/buckyos
-%attr(0644,root,root) /etc/systemd/system/buckyos.service

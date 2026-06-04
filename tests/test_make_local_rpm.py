@@ -29,7 +29,6 @@ class MakeLocalRpmTests(unittest.TestCase):
         spec = rpm._render_spec(
             rpm_version="0.6.0",
             rpm_release="build260529",
-            rpm_architecture="aarch64",
             payload_tree=Path("/tmp/buckyos-payload"),
             layout=layout,
             component_keys=["buckyos"],
@@ -37,7 +36,7 @@ class MakeLocalRpmTests(unittest.TestCase):
 
         self.assertIn("Version: 0.6.0", spec)
         self.assertIn("Release: build260529", spec)
-        self.assertIn("BuildArch: aarch64", spec)
+        self.assertNotIn("BuildArch:", spec)
         self.assertIn("Requires: (moby-engine or docker-ce or docker-engine)", spec)
         self.assertIn("BEGIN COMPONENT HOOK: buckyos_preinstall", spec)
         self.assertIn("BEGIN COMPONENT HOOK: buckyos_postinstall", spec)
@@ -50,7 +49,9 @@ class MakeLocalRpmTests(unittest.TestCase):
         self.assertIn("systemctl start buckyos.service", spec)
         self.assertIn(".buckyos_installer_defaults", spec)
         self.assertIn("%preun", spec)
-        self.assertIn("/etc/systemd/system/buckyos.service", spec)
+        self.assertIn("%global __os_install_post %{nil}", spec)
+        files_section = spec.split("%files", 1)[1]
+        self.assertNotIn("/etc/systemd/system/buckyos.service", files_section)
         self.assertIn('cp -a /tmp/buckyos-payload/. "%{buildroot}/"', spec)
 
     def test_linux_hooks_are_discovered_from_rpm_pkg(self) -> None:
@@ -83,27 +84,24 @@ class MakeLocalRpmTests(unittest.TestCase):
                 "/opt/buckyos/.buckyos_installer_defaults",
                 "/opt/buckyos/.buckyos_installer_defaults/etc",
                 "/opt/buckyos/.buckyos_installer_defaults/etc/node_gateway.json",
-                "/etc",
-                "/etc/systemd",
-                "/etc/systemd/system",
-                "/etc/systemd/system/buckyos.service",
             ],
             layout=layout,
             failures=failures,
             package_kind="rpm",
-            include_systemd_service=True,
+            include_systemd_service=False,
         )
         self.assertEqual(failures, [])
 
         rpm._verify_linux_payload_contract(
             payload_paths=[
+                "/etc/systemd/system/buckyos.service",
                 "/opt/buckyos/data/user.db",
                 "/Applications/BuckyOS.app/Contents/Info.plist",
             ],
             layout=layout,
             failures=failures,
             package_kind="rpm",
-            include_systemd_service=True,
+            include_systemd_service=False,
         )
         self.assertTrue(any("undeclared paths" in failure for failure in failures))
         self.assertTrue(any("BuckyOS.app" in failure for failure in failures))
