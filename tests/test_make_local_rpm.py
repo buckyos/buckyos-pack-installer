@@ -38,12 +38,28 @@ class MakeLocalRpmTests(unittest.TestCase):
         self.assertIn("Version: 0.6.0", spec)
         self.assertIn("Release: build260529", spec)
         self.assertIn("BuildArch: aarch64", spec)
-        self.assertIn("Requires: (docker-ce or moby-engine or docker-engine)", spec)
+        self.assertIn("Requires: (moby-engine or docker-ce or docker-engine)", spec)
+        self.assertIn("BEGIN COMPONENT HOOK: buckyos_preinstall", spec)
+        self.assertIn("BEGIN COMPONENT HOOK: buckyos_postinstall", spec)
+        self.assertIn("# BEGIN AUTO-GENERATED: modules", spec)
+        self.assertIn("# BEGIN AUTO-GENERATED: data_paths", spec)
         self.assertIn('rm -rf "$BUCKYOS_ROOT/bin/"', spec)
+        self.assertIn('rm -rf "$BUCKYOS_ROOT/bin/node-daemon"', spec)
+        self.assertIn('cp -p "$DEFAULTS_DIR/etc/node_gateway.json" "$BUCKYOS_ROOT/etc/node_gateway.json"', spec)
+        self.assertIn('cp -a "$DEFAULTS_DIR/data/." "$BUCKYOS_ROOT/data/"', spec)
+        self.assertIn("systemctl start buckyos.service", spec)
         self.assertIn(".buckyos_installer_defaults", spec)
         self.assertIn("%preun", spec)
         self.assertIn("/etc/systemd/system/buckyos.service", spec)
         self.assertIn('cp -a /tmp/buckyos-payload/. "%{buildroot}/"', spec)
+
+    def test_linux_hooks_are_discovered_from_rpm_pkg(self) -> None:
+        hook = rpm._discover_linux_hook("buckyos", "preinstall")
+
+        self.assertIsNotNone(hook)
+        assert hook is not None
+        self.assertEqual(hook.name, "buckyos_preinstall")
+        self.assertEqual(hook.parent.name, "rpm_pkg")
 
     def test_verify_payload_contract_allows_declared_paths_only(self) -> None:
         layout = rpm.AppLayout(

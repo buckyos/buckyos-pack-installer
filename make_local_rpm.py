@@ -32,9 +32,9 @@ PROJECT_YAML = SRC_DIR / "bucky_project.yaml"
 RESULT_ROOT_DIR = Path(os.environ.get("BUCKYOS_BUILD_ROOT", "/opt/buckyosci"))
 TMP_INSTALL_DIR = RESULT_ROOT_DIR / "rpm-build"
 
-LINUX_RPM_SCRIPTS_DIR = Path(__file__).resolve().parent / "linux_rpm" / "scripts"
-LINUX_DEB_SCRIPTS_DIR = Path(__file__).resolve().parent / "linux_deb" / "scripts"
-DEB_TEMPLATE_DIR = Path(__file__).resolve().parent / "deb_template"
+RPM_PKG_DIR = Path(__file__).resolve().parent / "rpm_pkg"
+RPM_SPEC_TEMPLATE = RPM_PKG_DIR / "buckyos.spec"
+DEB_PKG_DIR = Path(__file__).resolve().parent / "deb_pkg"
 BUCKYOS_DEFAULTS_SUBDIR = ".buckyos_installer_defaults"
 IGNORED_STAGE_NAMES = {".DS_Store", "__pycache__"}
 
@@ -435,24 +435,62 @@ def _linux_component_keys(project_yaml_path: Path, manifest_path: Path | None) -
 
 def _discover_linux_hook(component_key: str, step: str) -> Path | None:
     return common.discover_component_hook(
-        scripts_dirs=(LINUX_RPM_SCRIPTS_DIR, LINUX_DEB_SCRIPTS_DIR, DEB_TEMPLATE_DIR / "DEBIAN"),
+        scripts_dirs=(RPM_PKG_DIR, DEB_PKG_DIR),
         component_key=component_key,
         step=step,
         extensions=("", ".sh"),
     )
 
 
+AUTO_BEGIN = "# BEGIN AUTO-GENERATED:"
+AUTO_END = "# END AUTO-GENERATED:"
+
+
+def _replace_marked_block(text: str, block_name: str, new_lines: List[str], indent: str = "") -> str:
+    begin = f"{AUTO_BEGIN} {block_name}"
+    end = f"{AUTO_END} {block_name}"
+    lines = text.splitlines()
+    try:
+        i0 = next(i for i, line in enumerate(lines) if line.strip() == begin)
+        i1 = next(i for i, line in enumerate(lines) if line.strip() == end and i > i0)
+    except StopIteration:
+        appended = [begin] + [indent + line for line in new_lines] + [end]
+        return text.rstrip() + "\n" + "\n".join(appended) + "\n"
+
+    replaced = lines[: i0 + 1] + [indent + line for line in new_lines] + lines[i1:]
+    return "\n".join(replaced).rstrip("\n") + "\n"
+
+
+def _render_linux_hook_text(*, hook_path: Path, component_key: str, step: str, layout: AppLayout) -> str:
+    hook_text = hook_path.read_text(encoding="utf-8", errors="ignore")
+    if component_key == "buckyos" and step == "preinstall":
+        hook_text = _replace_marked_block(hook_text, "modules", _rm_lines("$BUCKYOS_ROOT", layout.module_paths))
+    if component_key == "buckyos" and step == "postinstall":
+        hook_text = _replace_marked_block(
+            hook_text,
+            "data_paths",
+            _data_copy_lines("$BUCKYOS_ROOT", "$DEFAULTS_DIR", layout.data_paths),
+            indent="  ",
+        )
+    return hook_text.rstrip("\n")
+
+
 def _escape_spec_body_line(line: str) -> str:
     return line.replace("%", "%%")
 
 
-def _shell_hook_lines(component_keys: List[str], step: str) -> List[str]:
+def _shell_hook_lines(component_keys: List[str], step: str, *, layout: AppLayout) -> List[str]:
     out: List[str] = []
     for component_key in component_keys:
         hook_path = _discover_linux_hook(component_key, step)
         if hook_path is None:
             continue
-        hook_text = hook_path.read_text(encoding="utf-8")
+        hook_text = _render_linux_hook_text(
+            hook_path=hook_path,
+            component_key=component_key,
+            step=step,
+            layout=layout,
+        )
         out.extend(
             [
                 f'echo "[buckyos] running {component_key}_{step} hook"',
@@ -514,6 +552,16 @@ def _scriptlet(lines: List[str]) -> str:
     return "\n".join(lines).rstrip("\n") + "\n"
 
 
+def _render_template(template_path: Path, replacements: dict[str, str]) -> str:
+    text = template_path.read_text(encoding="utf-8")
+    for key, value in replacements.items():
+        text = text.replace("{{" + key + "}}", value)
+    unresolved = sorted(set(re.findall(r"{{[A-Za-z0-9_]+}}", text)))
+    if unresolved:
+        raise ValueError(f"unresolved rpm spec template placeholders: {', '.join(unresolved)}")
+    return text
+
+
 def _render_spec(
     *,
     rpm_version: str,
@@ -525,50 +573,13 @@ def _render_spec(
 ) -> str:
     pre_lines = [
         "set -e",
-        'BUCKYOS_ROOT="/opt/buckyos"',
-        *_shell_hook_lines(component_keys, "preinstall"),
-        'if [ -d "$BUCKYOS_ROOT/bin/" ]; then',
-        "  systemctl stop buckyos.service >/dev/null 2>&1 || true",
-        '  if [ -f "$BUCKYOS_ROOT/bin/stop.py" ]; then',
-        '    python3 "$BUCKYOS_ROOT/bin/stop.py" >/dev/null 2>&1 || true',
-        "  fi",
-        '  rm -rf "$BUCKYOS_ROOT/bin/"',
-        "fi",
-        *_rm_lines("$BUCKYOS_ROOT", layout.module_paths),
+        *_shell_hook_lines(component_keys, "preinstall", layout=layout),
         "exit 0",
     ]
 
     post_lines = [
         "set -e",
-        'BUCKYOS_ROOT="/opt/buckyos"',
-        'DEFAULTS_DIR="$BUCKYOS_ROOT/.buckyos_installer_defaults"',
-        "",
-        "ensure_mutable_dir() {",
-        '  local path="$1"',
-        '  mkdir -p "$path"',
-        '  chmod 0777 "$path"',
-        "}",
-        "",
-        'if [ -d "$DEFAULTS_DIR" ]; then',
-        *["  " + line if line else "" for line in _data_copy_lines("$BUCKYOS_ROOT", "$DEFAULTS_DIR", layout.data_paths)],
-        "fi",
-        "",
-        *_shell_hook_lines(component_keys, "postinstall"),
-        "",
-        'ensure_mutable_dir "$BUCKYOS_ROOT/data"',
-        'ensure_mutable_dir "$BUCKYOS_ROOT/data/home"',
-        'ensure_mutable_dir "$BUCKYOS_ROOT/data/cache"',
-        'ensure_mutable_dir "$BUCKYOS_ROOT/data/srv"',
-        'ensure_mutable_dir "$BUCKYOS_ROOT/data/var"',
-        'ensure_mutable_dir "$BUCKYOS_ROOT/local"',
-        'ensure_mutable_dir "$BUCKYOS_ROOT/logs"',
-        'ensure_mutable_dir "$BUCKYOS_ROOT/storage"',
-        "",
-        "systemctl stop buckyos.service >/dev/null 2>&1 || true",
-        "systemctl daemon-reload",
-        "systemctl enable buckyos.service",
-        "systemctl restart buckyos.service",
-        'echo "BuckyOS install success, open http://127.0.0.1:3182/index.html to start, ENJOY!"',
+        *_shell_hook_lines(component_keys, "postinstall", layout=layout),
         "exit 0",
     ]
 
@@ -584,49 +595,19 @@ def _render_spec(
     ]
 
     payload_arg = shlex.quote(str(payload_tree))
-    return f"""Name: buckyos
-Version: {rpm_version}
-Release: {rpm_release}
-Summary: BuckyOS system software
-License: Proprietary
-URL: https://buckyos.org
-BuildArch: {rpm_architecture}
-AutoReqProv: no
-
-Requires: python3
-Requires: curl
-Requires: openssl
-Requires: psmisc
-Requires: (docker-ce or moby-engine or docker-engine)
-
-%global debug_package %{{nil}}
-
-%description
-BuckyOS system software, including node_daemon, node_active, cyfs_gateway,
-app_loader, system_config_service, verify_hub and default config files.
-
-%prep
-
-%build
-
-%install
-rm -rf "%{{buildroot}}"
-mkdir -p "%{{buildroot}}"
-cp -a {payload_arg}/. "%{{buildroot}}/"
-
-%pre
-{_scriptlet(pre_lines)}
-%post
-{_scriptlet(post_lines)}
-%preun
-{_scriptlet(preun_lines)}
-%postun
-{_scriptlet(postun_lines)}
-%files
-%defattr(-,root,root,-)
-/opt/buckyos
-%attr(0644,root,root) /etc/systemd/system/buckyos.service
-"""
+    return _render_template(
+        RPM_SPEC_TEMPLATE,
+        {
+            "rpm_version": rpm_version,
+            "rpm_release": rpm_release,
+            "rpm_architecture": rpm_architecture,
+            "payload_tree": payload_arg,
+            "pre_script": _scriptlet(pre_lines),
+            "post_script": _scriptlet(post_lines),
+            "preun_script": _scriptlet(preun_lines),
+            "postun_script": _scriptlet(postun_lines),
+        },
+    )
 
 
 def _find_built_rpm(rpmbuild_root: Path, rpm_version: str, rpm_release: str) -> Path:
@@ -816,7 +797,7 @@ def verify_pkg(
                 "systemctl stop buckyos.service >/dev/null 2>&1 || true",
                 "systemctl daemon-reload",
                 "systemctl enable buckyos.service",
-                "systemctl restart buckyos.service",
+                "systemctl start buckyos.service",
                 "systemctl disable --now buckyos.service >/dev/null 2>&1 || true",
             ]
             for snippet in required_script_snippets:

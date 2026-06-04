@@ -208,6 +208,41 @@ class MakeLocalPkgManifestTests(unittest.TestCase):
             ),
         )
 
+    def test_verify_pkg_infers_rpm_format_from_extension(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            project = root / "buckyos" / "src" / "bucky_project.json"
+            _write_project(project, app_key="buckyos", modules={})
+
+            calls: list[list[str]] = []
+            original_run = make_local_pkg._run
+
+            def fake_run(cmd: list[str], *, cwd: Path | None = None, dry_run: bool = False) -> int:
+                calls.append(cmd)
+                return 0
+
+            try:
+                make_local_pkg._run = fake_run
+                rc = make_local_pkg.verify_pkg(
+                    [
+                        str(root / "publish" / "buckyos-linux-amd64-0.6.0.rpm"),
+                        "--project",
+                        str(project),
+                        "--build-root",
+                        str(root / "stage"),
+                    ]
+                )
+            finally:
+                make_local_pkg._run = original_run
+
+        self.assertEqual(rc, 0)
+        self.assertEqual(Path(calls[0][1]).name, "make_local_rpm.py")
+        self.assertEqual(calls[0][2], "verify-pkg")
+
+    def test_verify_pkg_rejects_format_extension_conflict(self) -> None:
+        with self.assertRaisesRegex(RuntimeError, "conflicts with package extension"):
+            make_local_pkg.verify_pkg(["buckyos-linux-amd64-0.6.0.rpm", "--format", "deb"])
+
 
 if __name__ == "__main__":
     unittest.main()
