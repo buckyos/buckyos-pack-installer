@@ -50,6 +50,7 @@ class MakeLocalRpmTests(unittest.TestCase):
         self.assertIn(".buckyos_installer_defaults", spec)
         self.assertIn("%preun", spec)
         self.assertIn("%global __os_install_post %{nil}", spec)
+        self.assertIn("%global _build_id_links none", spec)
         files_section = spec.split("%files", 1)[1]
         self.assertNotIn("/etc/systemd/system/buckyos.service", files_section)
         self.assertIn('cp -a /tmp/buckyos-payload/. "%{buildroot}/"', spec)

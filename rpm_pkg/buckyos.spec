@@ -16,6 +16,7 @@ Requires: (moby-engine or docker-ce or docker-engine)
 %global debug_package %{nil}
 # Keep prebuilt payload files unchanged after %install.
 %global __os_install_post %{nil}
+%global _build_id_links none
 
 %description
 BuckyOS system software, including node_daemon, node_active, cyfs_gateway,
