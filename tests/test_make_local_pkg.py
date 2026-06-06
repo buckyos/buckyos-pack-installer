@@ -198,7 +198,14 @@ class MakeLocalPkgManifestTests(unittest.TestCase):
                 make_local_pkg._run_checked = original_run_checked
 
         self.assertEqual(calls[0], (["cargo", "update"], cyfs_project.parent.resolve(), True))
-        self.assertEqual(calls[1], (["buckyos-build", "--target=x86_64-unknown-linux-gnu"], cyfs_project.parent.resolve(), True))
+        self.assertEqual(
+            calls[1],
+            (
+                ["buckyos-build", "--app=cyfs-gateway", "--target=x86_64-unknown-linux-gnu"],
+                cyfs_project.parent.resolve(),
+                True,
+            ),
+        )
         self.assertEqual(
             calls[2],
             (
@@ -206,6 +213,102 @@ class MakeLocalPkgManifestTests(unittest.TestCase):
                 cyfs_project.parent.resolve(),
                 True,
             ),
+        )
+
+    def test_prepare_publish_dependency_passes_timings_dir_to_devkit(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            buckyos_project = root / "buckyos" / "src" / "bucky_project.json"
+            cyfs_project = root / "cyfs-gateway" / "src" / "bucky_project.json"
+            _write_project(
+                buckyos_project,
+                app_key="buckyos",
+                modules={},
+                deps={
+                    "cyfs-gateway": {
+                        "type": "buckyos_project",
+                        "source": "../../cyfs-gateway/src",
+                    }
+                },
+            )
+            _write_project(cyfs_project, app_key="cyfs-gateway", modules={"cyfs-gateway": "bin/cyfs-gateway/"})
+            target = make_local_pkg.TargetScript(
+                platform_key="linux",
+                package_format="deb",
+                script_path=Path("make_local_deb.py"),
+                architecture="amd64",
+                build_root=root / "stage",
+            )
+            calls: list[list[str]] = []
+            original_run_checked = make_local_pkg._run_checked
+
+            def fake_run_checked(cmd: list[str], *, cwd: Path | None = None, dry_run: bool = False) -> None:
+                calls.append(cmd)
+
+            try:
+                make_local_pkg._run_checked = fake_run_checked
+                make_local_pkg._prepare_publish_dependencies(
+                    project_path=buckyos_project,
+                    target=target,
+                    dry_run=True,
+                    skip_cargo_update=True,
+                    rust_target=None,
+                    timings_dir=str(root / "timings"),
+                )
+            finally:
+                make_local_pkg._run_checked = original_run_checked
+
+        self.assertEqual(
+            calls[0],
+            [
+                "buckyos-build",
+                "--app=cyfs-gateway",
+                f"--timings-dir={root / 'timings' / 'linux' / 'amd64' / 'cyfs-gateway'}",
+            ],
+        )
+
+    def test_common_prepare_builds_only_packaged_apps_and_passes_timings_dir(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            project = root / "buckyos" / "src" / "bucky_project.json"
+            _write_project(project, app_key="buckyos", modules={})
+            target = make_local_pkg.TargetScript(
+                platform_key="linux",
+                package_format="deb",
+                script_path=Path("make_local_deb.py"),
+                architecture="amd64",
+                build_root=root / "stage",
+            )
+            calls: list[list[str]] = []
+            original_run_checked = make_local_pkg._run_checked
+
+            def fake_run_checked(cmd: list[str], *, cwd: Path | None = None, dry_run: bool = False) -> None:
+                calls.append(cmd)
+
+            try:
+                make_local_pkg._run_checked = fake_run_checked
+                make_local_pkg._prepare_common_build_root(
+                    project_path=project,
+                    target=target,
+                    dry_run=True,
+                    skip_cargo_update=True,
+                    desktop_app=None,
+                    skip_desktop_app_build=True,
+                    rust_target="x86_64-unknown-linux-gnu",
+                    timings_dir=str(root / "timings"),
+                )
+            finally:
+                make_local_pkg._run_checked = original_run_checked
+
+        self.assertEqual(
+            calls[0],
+            [
+                "buckyos-build",
+                "--app=buckycli",
+                "--app=buckyos",
+                "--target=x86_64-unknown-linux-gnu",
+                f"--timings-dir={root / 'timings' / 'linux' / 'amd64' / 'buckyos'}",
+            ],
         )
 
     def test_verify_pkg_infers_rpm_format_from_extension(self) -> None:
