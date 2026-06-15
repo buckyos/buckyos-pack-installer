@@ -30,7 +30,7 @@ manifest 会固化：
 0. 注意依赖，buckyos的local安装包依赖cyfs-gateway和BuckyOSApp,src目录结构固定。安装脚本不会去做git的任何操作
 1. cyfs-gateway 使用 `buckyos-build` / `buckyos-install` 构建，构建目录在 `BUCKYOS_ROOT`，BuckyOSApp 使用 `pnpm run tauri build` 构建，构建目录在 `$RUST_BUILD/release/bundle/...`
 2. 在本仓库内用 `uv run ./src/buckyos-build.py` 和 `uv run buckyos-install` 准备好 `BUCKYOS_BUILD_ROOT` 下的发布目录。
-3. 运行 `uv run ./src/make_config.py release --rootfs <staged_rootfs>` 生成发布配置。
+3. 在 `src/` 目录运行 `deno task make_config release --rootfs <staged_rootfs>` 生成发布配置。
 ### 制作安装包
 4. 调用对应平台的 `make_local_*` 脚本执行 `build-pkg`。
 5. 如需校验，调用对应脚本的 `verify-pkg`。
@@ -77,7 +77,7 @@ uv run ./src/publish/make_local_deb.py build-pkg amd64 0.5.1+build260115 \
 
 - 清理并重建 `BUCKYOS_BUILD_ROOT`
 - 构建并安装 `cyfs-gateway`、`buckycli`、`buckyos`
-- 执行 `uv run ./src/make_config.py release --rootfs <staged_rootfs>`
+- 在 `src/` 目录执行 `deno task make_config release --rootfs <staged_rootfs>`
 - 按约定在 BuckyOS 同层目录查找并构建桌面端项目：
   `../cyfs-gateway`、`../BuckyOSApp`
 - 桌面端构建产物优先从用户环境变量 `RUST_BUILD` 读取；若未设置，则读取 `~/.cargo/config.toml` 的 `[build].target-dir`；再回退到 `/tmp/rust_build`
