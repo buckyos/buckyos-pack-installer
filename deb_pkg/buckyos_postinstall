@@ -1,5 +1,3 @@
-#!/bin/bash
-set -e
 BUCKYOS_ROOT="/opt/buckyos"
 DEFAULTS_DIR="$BUCKYOS_ROOT/.buckyos_installer_defaults"
 
@@ -41,8 +39,7 @@ Restart=always
 WantedBy=multi-user.target
 EOF
 
-
-systemctl stop buckyos.service
+systemctl stop buckyos.service >/dev/null 2>&1 || true
 systemctl daemon-reload
 systemctl enable buckyos.service
 systemctl start buckyos.service
