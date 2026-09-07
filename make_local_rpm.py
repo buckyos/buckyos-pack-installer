@@ -51,7 +51,7 @@ class AppLayout:
 
 
 def yaml_load_file(path: Path) -> dict[str, Any]:
-    return common.yaml_load_file(path)
+    return common.project_load_file(path)
 
 
 def _expand_vars(s: str) -> str:

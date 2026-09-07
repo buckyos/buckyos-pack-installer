@@ -13,6 +13,13 @@ import package_common as common
 
 
 class PackageCommonTests(unittest.TestCase):
+    def test_project_load_file_accepts_json(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            project = Path(td) / "bucky_project.json"
+            project.write_text('{"name":"buckyos"}', encoding="utf-8")
+
+            self.assertEqual(common.project_load_file(project), {"name": "buckyos"})
+
     def test_parse_bool_rejects_ambiguous_strings(self) -> None:
         self.assertTrue(common.parse_bool("true", field_name="field"))
         self.assertFalse(common.parse_bool("false", field_name="field"))

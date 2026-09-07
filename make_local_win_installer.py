@@ -56,7 +56,7 @@ WINDOWS_SERVICE_SCRIPT_NAMES = (
 
 
 def yaml_load_file(path: Path) -> Dict[str, Any]:
-    return common.yaml_load_file(path)
+    return common.project_load_file(path)
 
 
 def json_load_file(path: Path) -> Dict[str, Any]:

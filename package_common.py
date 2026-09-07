@@ -37,6 +37,12 @@ def json_load_file(path: Path) -> dict[str, Any]:
     return data
 
 
+def project_load_file(path: Path) -> dict[str, Any]:
+    if path.suffix.lower() == ".json":
+        return json_load_file(path)
+    return yaml_load_file(path)
+
+
 def parse_bool(value: Any, *, field_name: str, default: bool = False) -> bool:
     if value is None:
         return default
