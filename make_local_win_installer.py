@@ -20,6 +20,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -437,37 +438,6 @@ def _hook_exec_command(var_name: str, hook_rel: str) -> str:
     raise ValueError(f"unsupported Windows hook extension: {hook_rel}")
 
 
-def _append_windows_hook_call(
-    lines: List[str],
-    *,
-    comp_key: str,
-    var_name: str,
-    hook_rel: str,
-    step: str,
-) -> None:
-    error_code = {"preinstall": "50", "postinstall": "70", "preuninstall": "80"}.get(step, "70")
-    label = f"{_sanitize_id(comp_key).replace('-', '_')}_{step}"
-    hook_cmd = _hook_exec_command(var_name, hook_rel)
-    lines.append(f"  ; Run {comp_key} {step} hook")
-    lines.append(f"  nsExec::ExecToLog '{hook_cmd}'")
-    lines.append("  Pop $0")
-    lines.append("  ${If} $0 != 0")
-    lines.append(f"    IfSilent silent_hook_failed_{label} interactive_hook_failed_{label}")
-    lines.append(f"silent_hook_failed_{label}:")
-    lines.append('    FileOpen $1 "$InstallerLogPath" a')
-    lines.append(f'    FileWrite $1 "{comp_key} {step} hook failed with exit code $0.$\\r$\\n"')
-    lines.append("    FileClose $1")
-    lines.append(f"    SetErrorLevel {error_code}")
-    lines.append("    Abort")
-    lines.append(f"interactive_hook_failed_{label}:")
-    lines.append(
-        f'    MessageBox MB_OK|MB_ICONSTOP "{comp_key} {step} hook failed with exit code $0."'
-    )
-    lines.append(f"    SetErrorLevel {error_code}")
-    lines.append("    Abort")
-    lines.append("  ${EndIf}")
-
-
 def _iter_payload_file_basenames(root: Path, *, limit: int = 256) -> List[str]:
     names: List[str] = []
     if not root.exists():
@@ -637,6 +607,58 @@ def _escape_nsis_string(s: str) -> str:
     return s.replace('"', '$\\"').replace("\\", "\\\\")
 
 
+class _NSISTemplates:
+    """Named, literal NSIS fragments with single-pass @@NAME@@ substitution."""
+
+    _section = re.compile(r"^; @@template ([A-Z][A-Z0-9_]*)@@\n", re.MULTILINE)
+    _placeholder = re.compile(r"^@@([A-Z][A-Z0-9_]*)@@\n|@@([A-Z][A-Z0-9_]*)@@", re.MULTILINE)
+
+    def __init__(self, path: Path) -> None:
+        self.path = path
+        self.sections: Dict[str, str] = {}
+        parts = self._section.split(path.read_text(encoding="utf-8"))
+        for name, body in zip(parts[1::2], parts[2::2]):
+            if name in self.sections:
+                raise ValueError(f"duplicate NSIS template section {name!r}: {path}")
+            self.sections[name] = body
+        if "INSTALLER" not in self.sections:
+            raise ValueError(f"missing NSIS template section 'INSTALLER': {path}")
+
+    def render(self, section: str, **values: str) -> str:
+        if section not in self.sections:
+            raise ValueError(f"missing NSIS template section {section!r}: {self.path}")
+
+        def replace(match: re.Match[str]) -> str:
+            name = match.group(1) or match.group(2)
+            if name not in values:
+                raise ValueError(f"missing NSIS placeholder {name!r} in {section!r}: {self.path}")
+            return values[name]
+
+        # Whole-line slots consume their newline. Inserted fragments supply their
+        # own line endings, so an empty optional fragment leaves no blank line.
+        # Do not rescan replacements: NSIS $, braces and user values are literal.
+        return self._placeholder.sub(replace, self.sections[section])
+
+
+def _render_windows_hook(
+    templates: _NSISTemplates,
+    comp: PublishComponent,
+    comp_payload: Path,
+    var_name: str,
+    step: str,
+) -> str:
+    hook = _windows_payload_hook(comp_payload, step)
+    if hook is None:
+        return ""
+    hook_rel = hook.relative_to(comp_payload).as_posix().replace("/", "\\")
+    return templates.render(
+        "HOOK", KEY=comp.key, STEP=step,
+        LABEL=f"{_sanitize_id(comp.key).replace('-', '_')}_{step}",
+        COMMAND=_hook_exec_command(var_name, hook_rel),
+        ERROR_CODE={"preinstall": "50", "postinstall": "70", "preuninstall": "80"}[step],
+    )
+
+
 def generate_nsis_script(
     *,
     title: str,
@@ -648,19 +670,11 @@ def generate_nsis_script(
     license_file: Path | None = None,
     bundled_vcredist: Path | None = None,
 ) -> None:
-    """Generate the NSIS installer script."""
-    
-    # Map architecture
-    if architecture in ("amd64", "x86_64"):
-        nsis_arch = "x64"
-        allow_arch = "x64"
-    elif architecture in ("arm64", "aarch64"):
-        nsis_arch = "arm64"
-        allow_arch = "arm64"
-    else:
-        nsis_arch = "x86"
-        allow_arch = ""
-
+    """Fill installer.nsi.in with component metadata and optional NSIS fragments."""
+    templates = _NSISTemplates(WIN_PKG_PROJECT_DIR / "installer.nsi.in")
+    render = templates.render
+    is_x64 = architecture in ("amd64", "x86_64")
+    has_vcredist = bundled_vcredist is not None and bundled_vcredist.exists()
     launch_bundle = next((comp for comp in components if comp.kind == "bundle"), None)
     has_buckyosapp_bundle = any(
         comp.kind == "bundle" and comp.key.casefold() == "buckyosapp"
@@ -674,651 +688,106 @@ def generate_nsis_script(
         ),
         None,
     )
-
-    lines: List[str] = []
-    
-    # Header and definitions
-    lines.append("; BuckyOS Windows Installer - AUTO-GENERATED")
-    lines.append(f"; Version: {version}")
-    lines.append(f"; Architecture: {architecture}")
-    lines.append("")
-    lines.append("!include \"MUI2.nsh\"")
-    lines.append("!include \"LogicLib.nsh\"")
-    lines.append("!include \"FileFunc.nsh\"")
-    lines.append("!include \"nsDialogs.nsh\"")
-    lines.append("!include \"WinMessages.nsh\"")
-    
-    # Include x64 support for 64-bit installers
-    if nsis_arch == "x64":
-        lines.append("!include \"x64.nsh\"")
-    lines.append("")
-    
-    lines.append(f'!define PRODUCT_NAME "{title}"')
-    lines.append(f'!define PRODUCT_VERSION "{version}"')
-    lines.append('!define PRODUCT_PUBLISHER "BuckyOS"')
-    lines.append('!define PRODUCT_WEB_SITE "https://github.com/buckyos"')
-    lines.append(f'!define PRODUCT_ARCH "{architecture}"')
-    lines.append("")
-    
-    # Installer attributes
-    lines.append(f'Name "${{PRODUCT_NAME}} ${{PRODUCT_VERSION}}"')
-    lines.append(
-        f'OutFile "{common.package_filename(platform_key="windows", architecture=architecture, version=version, package_format="exe")}"'
-    )
-    
-    # Set default install directory based on architecture
-    if nsis_arch == "x64":
-        lines.append('InstallDir "$PROGRAMFILES64\\BuckyOS"')
-    else:
-        lines.append('InstallDir "$PROGRAMFILES\\BuckyOS"')
-    
-    lines.append('InstallDirRegKey HKCU "Software\\BuckyOS" "InstallDir"')
-    lines.append("RequestExecutionLevel admin")
-    lines.append("ShowInstDetails show")
-    lines.append("ShowUninstDetails show")
-    lines.append("SetCompressor lzma")
-    lines.append("")
-    
-    # MUI settings
-    lines.append("; MUI Settings")
-    lines.append("!define MUI_ABORTWARNING")
-    lines.append("!define MUI_ICON \"${NSISDIR}\\Contrib\\Graphics\\Icons\\modern-install.ico\"")
-    lines.append("!define MUI_UNICON \"${NSISDIR}\\Contrib\\Graphics\\Icons\\modern-uninstall.ico\"")
-    if launch_bundle is not None:
-        lines.append("!define MUI_FINISHPAGE_RUN")
-        lines.append(f'!define MUI_FINISHPAGE_RUN_TEXT "Launch {launch_bundle.name}"')
-        lines.append('!define MUI_FINISHPAGE_RUN_FUNCTION "LaunchInstalledApplication"')
-    lines.append("")
-
-    # Variables for each component's install directory
-    lines.append("; Variables for component install directories")
-    lines.append("Var DockerCheckCode")
-    lines.append("Var PortCheckCode")
-    lines.append("Var PortCheckPort")
-    lines.append("Var VCRedistInstalled")
-    lines.append("Var VCRedistInstallCode")
-    lines.append("Var VCRedistVersion")
-    lines.append("Var ExistingBuckyRoot")
-    lines.append("Var BestInstallDrive")
-    lines.append("Var LaunchAfterInstall")
-    lines.append("Var InstallerLogPath")
-    for comp in components:
-        var_name = f"InstDir_{_sanitize_id(comp.key).replace('-', '_')}"
-        lines.append(f"Var {var_name}")
-    lines.append("")
-    
-    # Custom directory page variables
-    lines.append("; Custom directory page variables")
-    lines.append("Var Dialog")
-    lines.append("Var Label")
-    for comp in components:
-        var_name = f"DirReq_{_sanitize_id(comp.key).replace('-', '_')}"
-        lines.append(f"Var {var_name}")
-    lines.append("")
-    
-    # Pages - use custom directory page
-    lines.append("; Installer pages")
-    lines.append("!insertmacro MUI_PAGE_WELCOME")
-    if license_file and license_file.exists():
-        lines.append(f'!insertmacro MUI_PAGE_LICENSE "{license_file}"')
-    lines.append("!insertmacro MUI_PAGE_COMPONENTS")
-    lines.append("Page custom DirectoryPageCreate DirectoryPageLeave")
-    lines.append("!insertmacro MUI_PAGE_INSTFILES")
-    lines.append("!insertmacro MUI_PAGE_FINISH")
-    lines.append("")
-    lines.append("; Uninstaller pages")
-    lines.append("!insertmacro MUI_UNPAGE_CONFIRM")
-    lines.append("!insertmacro MUI_UNPAGE_INSTFILES")
-    lines.append("")
-    lines.append("; Language")
-    lines.append('!insertmacro MUI_LANGUAGE "English"')
-    lines.append("")
-    
-    # Custom directory page function
-    lines.append("; Custom directory page - allows selecting install path for each component")
-    lines.append("Function DirectoryPageCreate")
-    lines.append('  !insertmacro MUI_HEADER_TEXT "Choose Install Locations" "Choose the folder in which to install each component."')
-    lines.append("  nsDialogs::Create 1018")
-    lines.append("  Pop $Dialog")
-    lines.append('  ${If} $Dialog == error')
-    lines.append("    Abort")
-    lines.append('  ${EndIf}')
-    lines.append("")
-    
-    # Create UI elements for each component
-    y_pos = 0
+    blocks: Dict[str, List[str]] = {key: [] for key in (
+        "COMPONENT_VARIABLES", "DIRECTORY_VARIABLES", "DIRECTORY_CONTROLS",
+        "BROWSE_CALLBACKS", "DIRECTORY_LEAVE", "COMPONENT_INIT",
+        "COMPONENT_SECTIONS", "COMPONENT_DESCRIPTIONS", "UNINSTALL_SHORTCUTS",
+        "UNINSTALL_COMPONENTS",
+    )}
     for idx, comp in enumerate(components):
-        var_name = f"InstDir_{_sanitize_id(comp.key).replace('-', '_')}"
-        dir_req_var = f"DirReq_{_sanitize_id(comp.key).replace('-', '_')}"
+        label = _sanitize_id(comp.key).replace("-", "_")
+        var = f"$InstDir_{label}"
+        directory_var = f"$DirReq_{label}"
         section_id = f"SEC_{_sanitize_id(comp.key).upper()}"
-        
-        lines.append(f'  ; {comp.name} directory selection')
-        lines.append(f'  ${{NSD_CreateLabel}} 0 {y_pos}u 100% 12u "{comp.name} Install Location:"')
-        lines.append(f'  Pop $Label')
-        lines.append(f'  ${{NSD_CreateDirRequest}} 0 {y_pos + 14}u 78% 12u "${var_name}"')
-        lines.append(f'  Pop ${dir_req_var}')
-        lines.append(f'  ${{NSD_CreateBrowseButton}} 80% {y_pos + 13}u 20% 14u "Browse..."')
-        lines.append(f'  Pop $0')
-        lines.append(f'  ${{NSD_OnClick}} $0 OnBrowse{idx}')
-        lines.append("")
-        y_pos += 40
-    
-    lines.append("  nsDialogs::Show")
-    lines.append("FunctionEnd")
-    lines.append("")
-    
-    # Browse button callbacks for each component
-    for idx, comp in enumerate(components):
-        var_name = f"InstDir_{_sanitize_id(comp.key).replace('-', '_')}"
-        dir_req_var = f"DirReq_{_sanitize_id(comp.key).replace('-', '_')}"
-        
-        lines.append(f"Function OnBrowse{idx}")
-        lines.append(f'  nsDialogs::SelectFolderDialog "Select Install Location for {comp.name}" ${var_name}')
-        lines.append(f'  Pop $0')
-        lines.append(f'  ${{If}} $0 != error')
-        lines.append(f'    StrCpy ${var_name} $0')
-        lines.append(f'    ${{NSD_SetText}} ${dir_req_var} ${var_name}')
-        lines.append(f'  ${{EndIf}}')
-        lines.append("FunctionEnd")
-        lines.append("")
-    
-    # Directory page leave function - save values
-    lines.append("Function DirectoryPageLeave")
-    for comp in components:
-        var_name = f"InstDir_{_sanitize_id(comp.key).replace('-', '_')}"
-        dir_req_var = f"DirReq_{_sanitize_id(comp.key).replace('-', '_')}"
-        lines.append(f'  ${{NSD_GetText}} ${dir_req_var} ${var_name}')
-    lines.append("FunctionEnd")
-    lines.append("")
-
-    # Runtime dependency checks
-    lines.append("; Runtime dependency checks")
-    lines.append("Function CheckDockerDesktopForUser")
-    lines.append('  StrCpy $DockerCheckCode "0"')
-    lines.append('  nsExec::Exec \'cmd /c "docker --version >nul 2>nul"\'')
-    lines.append("  Pop $0")
-    lines.append('  ${If} $0 != 0')
-    lines.append('    StrCpy $DockerCheckCode "1"')
-    lines.append("    Return")
-    lines.append("  ${EndIf}")
-    lines.append('  nsExec::Exec \'cmd /c "docker version >nul 2>nul"\'')
-    lines.append("  Pop $0")
-    lines.append('  ${If} $0 != 0')
-    lines.append('    StrCpy $DockerCheckCode "2"')
-    lines.append("    Return")
-    lines.append("  ${EndIf}")
-    lines.append("FunctionEnd")
-    lines.append("")
-
-    lines.append("Function CheckRequiredPorts")
-    lines.append('  StrCpy $PortCheckCode "0"')
-    lines.append('  StrCpy $PortCheckPort ""')
-    for port in ("3180", "80", "443"):
-        lines.append(f'  nsExec::ExecToStack \'powershell.exe -NoProfile -ExecutionPolicy Bypass -Command "$$p={port}; try {{ $$used=[System.Net.NetworkInformation.IPGlobalProperties]::GetIPGlobalProperties().GetActiveTcpListeners().Port -contains $$p; if ($$used) {{ exit 1 }}; exit 0 }} catch {{ exit 1 }}"\'')
-        lines.append("  Pop $0")
-        lines.append('  ${If} $0 != 0')
-        lines.append('    StrCpy $PortCheckCode "1"')
-        lines.append(f'    StrCpy $PortCheckPort "{port}"')
-        lines.append("    Return")
-        lines.append("  ${EndIf}")
-    lines.append("FunctionEnd")
-    lines.append("")
-
-    lines.append("Function IsVCRedistInstalled")
-    lines.append('  StrCpy $VCRedistInstalled "0"')
-    lines.append('  StrCpy $VCRedistVersion ""')
-    lines.append('  ReadRegDWORD $0 HKLM "SOFTWARE\\Microsoft\\VisualStudio\\14.0\\VC\\Runtimes\\x64" "Installed"')
-    lines.append('  ${If} $0 == 1')
-    lines.append('    StrCpy $VCRedistInstalled "1"')
-    lines.append('    ReadRegStr $VCRedistVersion HKLM "SOFTWARE\\Microsoft\\VisualStudio\\14.0\\VC\\Runtimes\\x64" "Version"')
-    lines.append("    Return")
-    lines.append("  ${EndIf}")
-    lines.append('  ReadRegDWORD $0 HKLM "SOFTWARE\\WOW6432Node\\Microsoft\\VisualStudio\\14.0\\VC\\Runtimes\\x64" "Installed"')
-    lines.append('  ${If} $0 == 1')
-    lines.append('    StrCpy $VCRedistInstalled "1"')
-    lines.append('    ReadRegStr $VCRedistVersion HKLM "SOFTWARE\\WOW6432Node\\Microsoft\\VisualStudio\\14.0\\VC\\Runtimes\\x64" "Version"')
-    lines.append("    Return")
-    lines.append("  ${EndIf}")
-    lines.append("FunctionEnd")
-    lines.append("")
-
-    if bundled_vcredist and bundled_vcredist.exists():
-        lines.append("Function ExtractBundledVCRedist")
-        lines.append("  InitPluginsDir")
-        lines.append('  SetOutPath "$PLUGINSDIR"')
-        lines.append(f'  File /oname=vcredist_x64.exe "{_escape_nsis_path(str(bundled_vcredist))}"')
-        lines.append("FunctionEnd")
-        lines.append("")
-
-        lines.append("Function InstallBundledVCRedist")
-        lines.append('  StrCpy $VCRedistInstallCode "missing"')
-        lines.append('  IfFileExists "$PLUGINSDIR\\vcredist_x64.exe" vcredist_install 0')
-        lines.append("  Return")
-        lines.append("vcredist_install:")
-        lines.append('  ExecWait \'"$PLUGINSDIR\\vcredist_x64.exe" /install /quiet /norestart\' $0')
-        lines.append("  StrCpy $VCRedistInstallCode $0")
-        lines.append("  StrCmp $VCRedistInstallCode 0 vcredist_install_ok")
-        lines.append("  StrCmp $VCRedistInstallCode 1641 vcredist_install_reboot")
-        lines.append("  StrCmp $VCRedistInstallCode 3010 vcredist_install_reboot")
-        lines.append("  Call IsVCRedistInstalled")
-        lines.append("  Return")
-        lines.append("vcredist_install_reboot:")
-        lines.append("  SetRebootFlag true")
-        lines.append("vcredist_install_ok:")
-        lines.append('  StrCpy $VCRedistInstalled "1"')
-        lines.append("FunctionEnd")
-        lines.append("")
-
-    lines.append("Function ExtractBundledStopScript")
-    lines.append("  InitPluginsDir")
-    lines.append('  SetOutPath "$PLUGINSDIR"')
-    if bundled_stop_script is not None:
-        lines.append(f'  File /oname=stop.ps1 "{_escape_nsis_path(str(bundled_stop_script))}"')
-    lines.append("FunctionEnd")
-    lines.append("")
-
-    lines.append("Function StopExistingBuckyOS")
-    lines.append('  StrCpy $ExistingBuckyRoot ""')
-    lines.append('  ReadRegStr $ExistingBuckyRoot HKCU "Environment" "BUCKYOS_ROOT"')
-    lines.append('  ${If} $ExistingBuckyRoot == ""')
-    lines.append('    ReadRegStr $ExistingBuckyRoot HKCU "Software\\BuckyOS" "InstallDir"')
-    lines.append('  ${EndIf}')
-    lines.append('  ${If} $ExistingBuckyRoot == ""')
-    lines.append('    ; Backward compatibility with previous system-service installations')
-    lines.append('    ReadRegStr $ExistingBuckyRoot HKLM "SYSTEM\\CurrentControlSet\\Control\\Session Manager\\Environment" "BUCKYOS_ROOT"')
-    lines.append('  ${EndIf}')
-    lines.append('  ${If} $ExistingBuckyRoot == ""')
-    lines.append('    ReadRegStr $ExistingBuckyRoot HKLM "Software\\BuckyOS" "BuckyOSServiceDir"')
-    lines.append('  ${EndIf}')
-    lines.append('  nsExec::Exec \'cmd /c "schtasks /Query /TN BuckyOSNodeDaemonKeepAlive >nul 2>&1 && schtasks /Delete /TN BuckyOSNodeDaemonKeepAlive /F >nul 2>&1"\'')
-    lines.append("  Pop $0")
-    lines.append('  DeleteRegValue HKCU "Software\\Microsoft\\Windows\\CurrentVersion\\Run" "BuckyOSDaemon"')
-    lines.append('  Push $ExistingBuckyRoot')
-    lines.append('  Call RunStopScript')
-    lines.append('  ${If} $ExistingBuckyRoot != ""')
-    lines.append('    ; Backward compatibility: stop/remove legacy Windows service if present')
-    lines.append('    nsExec::ExecToLog \'sc stop buckyos\'')
-    lines.append("    Sleep 2000")
-    lines.append('    nsExec::ExecToLog \'sc delete buckyos\'')
-    lines.append('  ${EndIf}')
-    lines.append("FunctionEnd")
-    lines.append("")
-
-    lines.append("Function RunStopScript")
-    lines.append("  Exch $0")
-    lines.append('  IfFileExists "$PLUGINSDIR\\stop.ps1" stop_script_exists stop_script_missing')
-    lines.append("stop_script_exists:")
-    lines.append('  nsExec::ExecToLog \'powershell.exe -NoProfile -ExecutionPolicy Bypass -File "$PLUGINSDIR\\stop.ps1"\'')
-    lines.append("  Return")
-    lines.append("stop_script_missing:")
-    lines.append('  nsExec::ExecToLog \'taskkill /F /IM node_daemon.exe\'')
-    lines.append("FunctionEnd")
-    lines.append("")
-
-    lines.append("Function un.RunStopScript")
-    lines.append("  Exch $0")
-    lines.append('  ${If} $0 == ""')
-    lines.append("    Return")
-    lines.append('  ${EndIf}')
-    lines.append('  IfFileExists "$0\\bin\\stop.ps1" un.stop_script_exists un.stop_script_missing')
-    lines.append("un.stop_script_exists:")
-    lines.append('  nsExec::ExecToLog \'powershell.exe -NoProfile -ExecutionPolicy Bypass -File "$0\\bin\\stop.ps1"\'')
-    lines.append("  Return")
-    lines.append("un.stop_script_missing:")
-    lines.append('  nsExec::ExecToLog \'taskkill /F /IM node_daemon.exe\'')
-    lines.append("FunctionEnd")
-    lines.append("")
-
-    if has_buckyosapp_bundle:
-        for function_name in ("StopBuckyOSApp", "un.StopBuckyOSApp"):
-            lines.append(f"Function {function_name}")
-            lines.append('  nsExec::Exec \'cmd /c "taskkill /F /T /IM buckyosapp.exe >nul 2>&1"\'')
-            lines.append("  Pop $0")
-            lines.append('  ${If} $0 == 0')
-            lines.append("    Sleep 500")
-            lines.append('  ${EndIf}')
-            lines.append("FunctionEnd")
-            lines.append("")
-
-    lines.append("Function SelectBestInstallDrive")
-    lines.append('  StrCpy $BestInstallDrive "C:"')
-    lines.append('  Delete "$TEMP\\buckyos_best_drive.txt"')
-    lines.append(
-        '  nsExec::ExecToLog \'powershell.exe -NoProfile -ExecutionPolicy Bypass -Command "$$d = Get-CimInstance Win32_LogicalDisk | Where-Object { $$_.DriveType -eq 3 -and $$_.FreeSpace -ne $$null } | Sort-Object FreeSpace -Descending | Select-Object -First 1 -ExpandProperty DeviceID; if ([string]::IsNullOrWhiteSpace($$d)) { $$d = \'\'C:\'\' }; Set-Content -Path \'\'$$env:TEMP\\\\buckyos_best_drive.txt\'\' -Value $$d -Encoding ASCII"\''
-    )
-    lines.append('  IfFileExists "$TEMP\\buckyos_best_drive.txt" +2 0')
-    lines.append("    Return")
-    lines.append('  FileOpen $0 "$TEMP\\buckyos_best_drive.txt" r')
-    lines.append("  IfErrors select_best_drive_done_read")
-    lines.append("  FileRead $0 $1")
-    lines.append("  FileClose $0")
-    lines.append("select_best_drive_done_read:")
-    lines.append('  Delete "$TEMP\\buckyos_best_drive.txt"')
-    lines.append('  StrCpy $1 $1 2')
-    lines.append('  ${If} $1 != ""')
-    lines.append('    StrCpy $BestInstallDrive $1')
-    lines.append('  ${EndIf}')
-    lines.append("FunctionEnd")
-    lines.append("")
-
-    # .onInit function
-    lines.append("; Functions")
-    lines.append("Function .onInit")
-    
-    # Add 64-bit runtime check for x64 installers
-    if nsis_arch == "x64":
-        lines.append('  ; Check if running on 64-bit Windows')
-        lines.append('  ${IfNot} ${RunningX64}')
-        lines.append("    IfSilent silent_bad_arch interactive_bad_arch")
-        lines.append("silent_bad_arch:")
-        lines.append("    SetErrorLevel 10")
-        lines.append("    Abort")
-        lines.append("interactive_bad_arch:")
-        lines.append('    MessageBox MB_OK|MB_ICONSTOP "This installer requires 64-bit Windows."')
-        lines.append('    Abort')
-        lines.append('  ${EndIf}')
-        lines.append('  ; Use 64-bit registry view')
-        lines.append('  SetRegView 64')
-        lines.append("")
-    
-    lines.append('  ; Initialize default install directories from bucky_project.yaml')
-    for comp in components:
-        var_name = f"InstDir_{_sanitize_id(comp.key).replace('-', '_')}"
-        lines.append(f'  StrCpy ${var_name} "{_escape_nsis_string(_nsis_default_target(comp))}"')
-    lines.append('  StrCpy $LaunchAfterInstall ""')
-    lines.append('  StrCpy $InstallerLogPath "$TEMP\\buckyos-windows-${PRODUCT_ARCH}-${PRODUCT_VERSION}.log"')
-    lines.append("")
-    lines.append("FunctionEnd")
-    lines.append("")
-
-    if launch_bundle is not None:
-        lines.append("Function LaunchInstalledApplication")
-        lines.append('  ${If} $LaunchAfterInstall == ""')
-        lines.append("    Return")
-        lines.append('  ${EndIf}')
-        lines.append('  IfFileExists "$LaunchAfterInstall" +2 0')
-        lines.append("    Return")
-        lines.append('  ExecShell "open" "$LaunchAfterInstall"')
-        lines.append("FunctionEnd")
-        lines.append("")
-    
-    # Sections for each component.
-    has_service = False
-    has_bundle = False
-    for idx, comp in enumerate(components):
-        section_id = f"SEC_{_sanitize_id(comp.key).upper()}"
-        var_name = f"InstDir_{_sanitize_id(comp.key).replace('-', '_')}"
-        
-        section_flag = " /o" if comp.optional and not comp.default_selected else ""
-        lines.append(f'Section{section_flag} "{comp.name}" {section_id}')
-        if not comp.optional:
-            lines.append("  SectionIn RO")
-        
-        # Source files - use component-specific install directory
+        context = dict(KEY=comp.key, NAME=comp.name, INSTALL_VAR=var)
         comp_payload = payload_dir / comp.key
+        blocks["COMPONENT_VARIABLES"].append(f"Var {var[1:]}\n")
+        blocks["DIRECTORY_VARIABLES"].append(f"Var {directory_var[1:]}\n")
+        blocks["DIRECTORY_CONTROLS"].append(render(
+            "DIRECTORY_CONTROLS", **context, DIRECTORY_VAR=directory_var,
+            INDEX=str(idx), LABEL_Y=str(idx * 40), INPUT_Y=str(idx * 40 + 14),
+            BUTTON_Y=str(idx * 40 + 13),
+        ))
+        blocks["BROWSE_CALLBACKS"].append(render(
+            "BROWSE_CALLBACKS", **context, DIRECTORY_VAR=directory_var, INDEX=str(idx),
+        ))
+        blocks["DIRECTORY_LEAVE"].append(f"  ${{NSD_GetText}} {directory_var} {var}\n")
+        blocks["COMPONENT_INIT"].append(render(
+            "COMPONENT_INIT", **context,
+            SERVICE_ROOT_FALLBACK=render("SERVICE_ROOT_FALLBACK", **context) if comp.system_service else "",
+            DEFAULT_TARGET=_escape_nsis_string(_nsis_default_target(comp)),
+        ))
+
+        payload_install = ""
         if comp_payload.exists():
-            if comp.kind == "bundle" and comp.key.casefold() == "buckyosapp":
-                lines.append("  ; Stop the desktop app before overwriting a running executable")
-                lines.append("  Call StopBuckyOSApp")
+            service_prerequisites = ""
             if comp.system_service:
-                dep_label = _sanitize_id(comp.key).replace("-", "_")
-                lines.append(f"dep_check_{dep_label}:")
-                lines.append("  ; Check Docker only for the selected service component")
-                lines.append("  Call CheckDockerDesktopForUser")
-                lines.append('  ${If} $DockerCheckCode != "0"')
-                lines.append('    ${If} $DockerCheckCode == "1"')
-                lines.append("      IfSilent silent_docker_missing interactive_docker_missing")
-                lines.append("silent_docker_missing:")
-                lines.append('      FileOpen $0 "$InstallerLogPath" a')
-                lines.append('      FileWrite $0 "Docker CLI is required but was not found.$\\r$\\n"')
-                lines.append("      FileClose $0")
-                lines.append("      SetErrorLevel 20")
-                lines.append("      Abort")
-                lines.append("interactive_docker_missing:")
-                lines.append('      MessageBox MB_ABORTRETRYIGNORE|MB_ICONSTOP "Docker Desktop is required.$\\r$\\nThe installer could not find the docker command in the current PATH.$\\r$\\n$\\r$\\nAbort=Cancel, Retry=Retry, Ignore=Open install guide." IDRETRY dep_check_' + dep_label + ' IDIGNORE open_docker_' + dep_label)
-                lines.append("      Abort")
-                lines.append(f"open_docker_{dep_label}:")
-                lines.append('      ExecShell "open" "https://docs.docker.com/desktop/setup/install/windows-install/"')
-                lines.append(f"      Goto dep_check_{dep_label}")
-                lines.append("    ${Else}")
-                lines.append("      IfSilent silent_docker_engine interactive_docker_engine")
-                lines.append("silent_docker_engine:")
-                lines.append('      FileOpen $0 "$InstallerLogPath" a')
-                lines.append('      FileWrite $0 "Docker Engine is not reachable.$\\r$\\n"')
-                lines.append("      FileClose $0")
-                lines.append("      SetErrorLevel 21")
-                lines.append("      Abort")
-                lines.append("interactive_docker_engine:")
-                lines.append('      MessageBox MB_RETRYCANCEL|MB_ICONSTOP "Docker Desktop was found, but Docker Engine is not reachable right now.$\\r$\\nPlease open Docker Desktop, wait until it finishes starting, then retry." IDRETRY dep_check_' + dep_label)
-                lines.append("      Abort")
-                lines.append("    ${EndIf}")
-                lines.append("  ${EndIf}")
-                lines.append("")
-                lines.append("  ; Check Visual C++ runtime only for the selected service component")
-                lines.append("  Call IsVCRedistInstalled")
-                lines.append('  ${If} $VCRedistInstalled != "1"')
-                if bundled_vcredist and bundled_vcredist.exists():
-                    lines.append("    Call ExtractBundledVCRedist")
-                    lines.append("    Call InstallBundledVCRedist")
-                    lines.append('    ${If} $VCRedistInstalled != "1"')
-                    lines.append(f"      IfSilent silent_vcredist_failed_{dep_label} interactive_vcredist_failed_{dep_label}")
-                    lines.append(f"silent_vcredist_failed_{dep_label}:")
-                    lines.append('      FileOpen $0 "$InstallerLogPath" a')
-                    lines.append('      FileWrite $0 "Visual C++ 2015-2022 x64 runtime installation failed with return code $VCRedistInstallCode.$\\r$\\n"')
-                    lines.append("      FileClose $0")
-                    lines.append("      SetErrorLevel 30")
-                    lines.append("      Abort")
-                    lines.append(f"interactive_vcredist_failed_{dep_label}:")
-                    lines.append('      MessageBox MB_OK|MB_ICONSTOP "Visual C++ Redistributable installation failed, return code: $VCRedistInstallCode. Installation aborted."')
-                    lines.append("      SetErrorLevel 30")
-                    lines.append("      Abort")
-                    lines.append("    ${EndIf}")
-                else:
-                    lines.append("    IfSilent silent_vcredist_missing interactive_vcredist_missing")
-                    lines.append("silent_vcredist_missing:")
-                    lines.append('    FileOpen $0 "$InstallerLogPath" a')
-                    lines.append('    FileWrite $0 "Visual C++ 2015-2022 x64 runtime is missing.$\\r$\\n"')
-                    lines.append("    FileClose $0")
-                    lines.append("    SetErrorLevel 30")
-                    lines.append("    Abort")
-                    lines.append("interactive_vcredist_missing:")
-                    lines.append('    MessageBox MB_ABORTRETRYIGNORE|MB_ICONSTOP "Visual C++ 2015-2022 (x64) runtime is required.$\\r$\\nAbort=Cancel, Retry=Retry, Ignore=Open Microsoft download page." IDRETRY dep_check_' + dep_label + ' IDIGNORE open_vcredist_' + dep_label)
-                    lines.append("    Abort")
-                    lines.append(f"open_vcredist_{dep_label}:")
-                    lines.append('    ExecShell "open" "https://aka.ms/vs/17/release/vc_redist.x64.exe"')
-                    lines.append(f"    Goto dep_check_{dep_label}")
-                lines.append("  ${EndIf}")
-                lines.append(f"dep_check_{dep_label}_done:")
-                lines.append("")
-                lines.append("  ; Stop existing service and running processes before overwrite")
-                lines.append("  Call ExtractBundledStopScript")
-                lines.append("  Call StopExistingBuckyOS")
-                lines.append("  ; Check required ports only when installation actually starts")
-                lines.append(f"port_check_{dep_label}:")
-                lines.append("  Call CheckRequiredPorts")
-                lines.append('  ${If} $PortCheckCode != "0"')
-                lines.append("    IfSilent silent_port_busy interactive_port_busy")
-                lines.append("silent_port_busy:")
-                lines.append('    FileOpen $0 "$InstallerLogPath" a')
-                lines.append('    FileWrite $0 "Required port $PortCheckPort is busy.$\\r$\\n"')
-                lines.append("    FileClose $0")
-                lines.append("    SetErrorLevel 40")
-                lines.append("    Abort")
-                lines.append("interactive_port_busy:")
-                lines.append('    MessageBox MB_RETRYCANCEL|MB_ICONSTOP "Required port $PortCheckPort cannot be bound.$\\r$\\nPlease free ports 3180, 80, and 443 before installing." IDRETRY port_check_' + dep_label)
-                lines.append("    Abort")
-                lines.append("  ${EndIf}")
-            pre_hook = _windows_payload_hook(comp_payload, "preinstall")
-            if pre_hook is not None:
-                _append_windows_hook_call(
-                    lines,
-                    comp_key=comp.key,
-                    var_name=var_name,
-                    hook_rel=pre_hook.relative_to(comp_payload).as_posix().replace("/", "\\"),
-                    step="preinstall",
+                vc_section = "VCREDIST_CHECK_BUNDLED" if has_vcredist else "VCREDIST_CHECK_MISSING"
+                service_prerequisites = render(
+                    "SERVICE_PREREQUISITES", LABEL=label,
+                    VCREDIST_CHECK=render(vc_section, LABEL=label),
                 )
-            lines.append(f'  SetOutPath "${var_name}"')
-            lines.append(f'  File /r "{comp_payload}\\*.*"')
-        
-        # For bundle type (UI executable) - create shortcuts
-        if comp.kind == "bundle":
-            has_bundle = True
-            # Determine the executable name from src or default
-            exe_name = comp.src if comp.src else f"{comp.key}.exe"
-            # If src contains path, extract just the filename
-            if "/" in exe_name or "\\" in exe_name:
-                exe_name = exe_name.replace("/", "\\").split("\\")[-1]
-            
-            lines.append("")
-            lines.append("  ; Create Start Menu shortcut")
-            lines.append('  CreateDirectory "$SMPROGRAMS\\BuckyOS"')
-            lines.append(f'  CreateShortcut "$SMPROGRAMS\\BuckyOS\\{comp.name}.lnk" "${var_name}\\{exe_name}" "" "${var_name}\\{exe_name}" 0')
-            lines.append("")
-            lines.append("  ; Create Desktop shortcut")
-            lines.append(f'  CreateShortcut "$DESKTOP\\{comp.name}.lnk" "${var_name}\\{exe_name}" "" "${var_name}\\{exe_name}" 0')
-            lines.append("")
-            lines.append("  ; Launch the UI app from the finish page after installation completes")
-            lines.append(f'  StrCpy $LaunchAfterInstall "${var_name}\\{exe_name}"')
-        
-        # For buckyos service component - set BUCKYOS_ROOT env var
-        if comp.system_service:
-            has_service = True
-            lines.append("")
-            lines.append("  ; Set BUCKYOS_ROOT environment variable")
-            lines.append(f'  WriteRegStr HKCU "Environment" "BUCKYOS_ROOT" "${var_name}"')
-            lines.append(f'  WriteRegStr HKCU "Software\\BuckyOS" "InstallDir" "${var_name}"')
-            lines.append('  ; Broadcast environment change')
-            lines.append('  SendMessage ${HWND_BROADCAST} ${WM_WININICHANGE} 0 "STR:Environment" /TIMEOUT=5000')
-            lines.append("")
-            lines.append("  ; Run seed defaults script")
-            lines.append(f'  nsExec::ExecToLog \'powershell.exe -ExecutionPolicy Bypass -File "${var_name}\\scripts\\seed_defaults.ps1"\'')
-            lines.append("  ; Allow installed service executables through Windows Firewall before first launch")
-            lines.append(f'  nsExec::ExecToLog \'powershell.exe -NoProfile -ExecutionPolicy Bypass -File "${var_name}\\scripts\\ensure_firewall_rules.ps1"\'')
-            lines.append("")
-            lines.append(f'  ; Save install directory to registry')
-            lines.append(f'  WriteRegStr HKCU "Software\\BuckyOS" "BuckyOSUserDir" "${var_name}"')
-        post_hook = _windows_payload_hook(comp_payload, "postinstall")
-        if post_hook is not None:
-            _append_windows_hook_call(
-                lines,
-                comp_key=comp.key,
-                var_name=var_name,
-                hook_rel=post_hook.relative_to(comp_payload).as_posix().replace("/", "\\"),
-                step="postinstall",
+            stop_app = ""
+            if comp.kind == "bundle" and comp.key.casefold() == "buckyosapp":
+                stop_app = "  ; Stop the desktop app before overwriting a running executable\n  Call StopBuckyOSApp\n"
+            payload_install = render(
+                "PAYLOAD_INSTALL", **context, PAYLOAD_PATH=str(comp_payload),
+                STOP_APP=stop_app, SERVICE_PREREQUISITES=service_prerequisites,
+                PRE_HOOK=_render_windows_hook(templates, comp, comp_payload, var, "preinstall"),
             )
-        
-        # Save each component's install directory to registry for uninstall
-        lines.append(f'  WriteRegStr HKCU "Software\\BuckyOS" "InstDir_{comp.key}" "${var_name}"')
-        
-        lines.append("SectionEnd")
-        lines.append("")
-    
-    # Section descriptions
-    lines.append("; Section descriptions")
-    lines.append("!insertmacro MUI_FUNCTION_DESCRIPTION_BEGIN")
-    for comp in components:
-        section_id = f"SEC_{_sanitize_id(comp.key).upper()}"
-        desc = f"Install {comp.name}"
-        if comp.optional:
-            desc += " (Optional)"
-        lines.append(f'  !insertmacro MUI_DESCRIPTION_TEXT ${{{section_id}}} "{desc}"')
-    lines.append("!insertmacro MUI_FUNCTION_DESCRIPTION_END")
-    lines.append("")
-    
-    # Post-install section
-    lines.append('Section "-PostInstall"')
-    lines.append('  ; Write registry keys')
-    lines.append('  WriteRegStr HKCU "Software\\BuckyOS" "Version" "${PRODUCT_VERSION}"')
-    lines.append("")
-    lines.append('  ; Create uninstaller in first component directory')
-    first_var = f"InstDir_{_sanitize_id(components[0].key).replace('-', '_')}"
-    lines.append(f'  SetOutPath "${first_var}"')
-    lines.append(f'  WriteUninstaller "${first_var}\\uninstall.exe"')
-    lines.append("")
-    lines.append('  ; Add/Remove Programs entry')
-    lines.append('  WriteRegStr HKCU "Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\BuckyOS" "DisplayName" "${PRODUCT_NAME}"')
-    lines.append(f'  WriteRegStr HKCU "Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\BuckyOS" "UninstallString" "${first_var}\\uninstall.exe"')
-    lines.append('  WriteRegStr HKCU "Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\BuckyOS" "DisplayVersion" "${PRODUCT_VERSION}"')
-    lines.append('  WriteRegStr HKCU "Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\BuckyOS" "Publisher" "${PRODUCT_PUBLISHER}"')
-    lines.append('  WriteRegStr HKCU "Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\BuckyOS" "URLInfoAbout" "${PRODUCT_WEB_SITE}"')
-    lines.append('  WriteRegDWORD HKCU "Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\BuckyOS" "NoModify" 1')
-    lines.append('  WriteRegDWORD HKCU "Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\BuckyOS" "NoRepair" 1')
-    lines.append("SectionEnd")
-    lines.append("")
-    
-    # Uninstaller section
-    lines.append("Section Uninstall")
-    
-    # Add 64-bit registry view for uninstaller
-    if nsis_arch == "x64":
-        lines.append('  SetRegView 64')
-    lines.append('  StrCpy $InstallerLogPath "$TEMP\\buckyos-windows-${PRODUCT_ARCH}-${PRODUCT_VERSION}-uninstall.log"')
+        bundle_install = ""
+        if comp.kind == "bundle":
+            exe_name = (comp.src or f"{comp.key}.exe").replace("/", "\\").split("\\")[-1]
+            bundle_install = render("BUNDLE_INSTALL", **context, EXE_NAME=exe_name)
+            blocks["UNINSTALL_SHORTCUTS"].append(
+                f'  Delete "$SMPROGRAMS\\BuckyOS\\{comp.name}.lnk"\n'
+                f'  Delete "$DESKTOP\\{comp.name}.lnk"\n'
+            )
+        blocks["COMPONENT_SECTIONS"].append(render(
+            "COMPONENT_SECTIONS", **context, SECTION_ID=section_id,
+            SECTION_FLAG=" /o" if comp.optional and not comp.default_selected else "",
+            REQUIRED_SECTION="  SectionIn RO\n" if not comp.optional else "",
+            PAYLOAD_INSTALL=payload_install, BUNDLE_INSTALL=bundle_install,
+            SERVICE_INSTALL=render("SERVICE_INSTALL", **context) if comp.system_service else "",
+            POST_HOOK=_render_windows_hook(templates, comp, comp_payload, var, "postinstall"),
+        ))
+        desc = f"Install {comp.name}" + (" (Optional)" if comp.optional else "")
+        blocks["COMPONENT_DESCRIPTIONS"].append(
+            f'  !insertmacro MUI_DESCRIPTION_TEXT ${{{section_id}}} "{desc}"\n'
+        )
+        blocks["UNINSTALL_COMPONENTS"].append(render(
+            "UNINSTALL_COMPONENTS", **context,
+            PREUNINSTALL_HOOK=_render_windows_hook(templates, comp, comp_payload, var, "preuninstall"),
+            REMOVE_COMPONENT=(render("SERVICE_UNINSTALL", **context) if comp.system_service
+                              else f'    RMDir /r "{var}"\n'),
+        ))
 
-    if has_buckyosapp_bundle:
-        lines.append('  ; Stop the desktop app before removing its executable')
-        lines.append('  Call un.StopBuckyOSApp')
-    
-    lines.append('  ; Stop old Windows service for backward compatibility')
-    lines.append('  nsExec::ExecToLog \'sc stop buckyos\'')
-    lines.append("  Sleep 3000")
-    lines.append('  nsExec::ExecToLog \'sc delete buckyos\'')
-    lines.append("")
-    
-    # Remove shortcuts for bundle components
-    lines.append('  ; Remove shortcuts')
-    for comp in components:
-        if comp.kind == "bundle":
-            lines.append(f'  Delete "$SMPROGRAMS\\BuckyOS\\{comp.name}.lnk"')
-            lines.append(f'  Delete "$DESKTOP\\{comp.name}.lnk"')
-    lines.append('  RMDir "$SMPROGRAMS\\BuckyOS"')
-    lines.append("")
-    
-    # Read install directories from registry and remove files
-    lines.append('  ; Read install directories from registry and remove files')
-    for comp in components:
-        var_name = f"InstDir_{_sanitize_id(comp.key).replace('-', '_')}"
-        comp_payload = payload_dir / comp.key
-        lines.append(f'  ReadRegStr ${var_name} HKCU "Software\\BuckyOS" "InstDir_{comp.key}"')
-        lines.append(f'  ${{If}} ${var_name} != ""')
-        preuninstall_hook = _windows_payload_hook(comp_payload, "preuninstall")
-        if preuninstall_hook is not None:
-            _append_windows_hook_call(
-                lines,
-                comp_key=comp.key,
-                var_name=var_name,
-                hook_rel=preuninstall_hook.relative_to(comp_payload).as_posix().replace("/", "\\"),
-                step="preuninstall",
-            )
-        if comp.system_service:
-            lines.append(f'    ; Stop running processes and old service for service component')
-            lines.append(f'    nsExec::ExecToLog \'sc stop buckyos\'')
-            lines.append("    Sleep 3000")
-            lines.append(f'    nsExec::ExecToLog \'sc delete buckyos\'')
-            lines.append(f'    Push ${var_name}')
-            lines.append(f'    Call un.RunStopScript')
-            lines.append(f'    ; Run cleanup script for service component')
-            lines.append(f'    nsExec::ExecToLog \'powershell.exe -ExecutionPolicy Bypass -File "${var_name}\\scripts\\uninstall_cleanup.ps1"\'')
-            lines.append(f'    RMDir /r "${var_name}\\.buckyos_installer_defaults"')
-            lines.append(f'    RMDir /r "${var_name}\\scripts"')
-            lines.append('    MessageBox MB_YESNO|MB_ICONQUESTION "Do you want to delete your data and identity?" IDYES +2')
-            lines.append("    Goto +2")
-            lines.append(f'    RMDir /r "${var_name}"')
-        else:
-            lines.append(f'    RMDir /r "${var_name}"')
-        lines.append(f'  ${{EndIf}}')
-        lines.append("")
-    
-    lines.append('  ; Remove registry keys')
-    lines.append('  DeleteRegKey HKCU "Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\BuckyOS"')
-    lines.append('  DeleteRegKey HKCU "Software\\BuckyOS"')
-    lines.append('  DeleteRegValue HKCU "Environment" "BUCKYOS_ROOT"')
-    lines.append('  ; Broadcast environment change')
-    lines.append('  SendMessage ${HWND_BROADCAST} ${WM_WININICHANGE} 0 "STR:Environment" /TIMEOUT=5000')
-    lines.append("SectionEnd")
-    
-    # Write with UTF-8 BOM for NSIS
-    content = "\r\n".join(lines) + "\r\n"
-    out_path.write_text(content, encoding="utf-8-sig")
+    content = render(
+        "INSTALLER", **{key: "".join(parts) for key, parts in blocks.items()},
+        TITLE=title, VERSION=version, ARCHITECTURE=architecture,
+        OUTPUT_FILENAME=common.package_filename(
+            platform_key="windows", architecture=architecture, version=version, package_format="exe",
+        ),
+        ARCH_INCLUDE='!include "x64.nsh"\n' if is_x64 else "",
+        DEFAULT_INSTALL_DIR=r"$PROGRAMFILES64\BuckyOS" if is_x64 else r"$PROGRAMFILES\BuckyOS",
+        FINISH_PAGE_OPTIONS=render("FINISH_PAGE_OPTIONS", NAME=launch_bundle.name) if launch_bundle else "",
+        LICENSE_PAGE=f'!insertmacro MUI_PAGE_LICENSE "{license_file}"\n' if license_file and license_file.exists() else "",
+        VCREDIST_FUNCTIONS=(render("VCREDIST_FUNCTIONS", VCREDIST_PATH=_escape_nsis_path(str(bundled_vcredist)))
+                           if has_vcredist else ""),
+        BUNDLED_STOP_SCRIPT=(f'  File /oname=stop.ps1 "{_escape_nsis_path(str(bundled_stop_script))}"\n'
+                             if bundled_stop_script is not None else ""),
+        STOP_APP_FUNCTIONS=("".join(render("STOP_APP_FUNCTIONS", FUNCTION_NAME=name)
+                                   for name in ("StopBuckyOSApp", "un.StopBuckyOSApp"))
+                            if has_buckyosapp_bundle else ""),
+        ARCH_INIT=render("ARCH_INIT") if is_x64 else "",
+        LAUNCH_FUNCTION=render("LAUNCH_FUNCTION") if launch_bundle else "",
+        FIRST_INSTALL_VAR=f"$InstDir_{_sanitize_id(components[0].key).replace('-', '_')}",
+        UNINSTALL_REG_VIEW="  SetRegView 64\n" if is_x64 else "",
+        UNINSTALL_STOP_APP=("  ; Stop the desktop app before removing its executable\n  Call un.StopBuckyOSApp\n"
+                            if has_buckyosapp_bundle else ""),
+    )
+    # Explicit bytes avoid platform newline translation; NSIS consumes UTF-8 BOM + CRLF.
+    out_path.write_bytes(content.replace("\n", "\r\n").encode("utf-8-sig"))
 
 
 def _print_file_tree(path: Path, prefix: str = "", is_last: bool = True) -> None:

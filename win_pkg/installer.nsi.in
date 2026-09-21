@@ -1,0 +1,543 @@
+; NSIS source templates. See README.md for the section and placeholder format.
+; Fixed installer behavior lives here; Python selects/repeats sections and fills values.
+; @@template INSTALLER@@
+; BuckyOS Windows Installer - AUTO-GENERATED
+; Version: @@VERSION@@
+; Architecture: @@ARCHITECTURE@@
+
+!include "MUI2.nsh"
+!include "LogicLib.nsh"
+!include "FileFunc.nsh"
+!include "nsDialogs.nsh"
+!include "WinMessages.nsh"
+@@ARCH_INCLUDE@@
+
+!define PRODUCT_NAME "@@TITLE@@"
+!define PRODUCT_VERSION "@@VERSION@@"
+!define PRODUCT_PUBLISHER "BuckyOS"
+!define PRODUCT_WEB_SITE "https://github.com/buckyos"
+!define PRODUCT_ARCH "@@ARCHITECTURE@@"
+
+Name "${PRODUCT_NAME} ${PRODUCT_VERSION}"
+OutFile "@@OUTPUT_FILENAME@@"
+InstallDir "@@DEFAULT_INSTALL_DIR@@"
+InstallDirRegKey HKCU "Software\BuckyOS" "InstallDir"
+RequestExecutionLevel admin
+ShowInstDetails show
+ShowUninstDetails show
+SetCompressor lzma
+
+; MUI Settings
+!define MUI_ABORTWARNING
+!define MUI_ICON "${NSISDIR}\Contrib\Graphics\Icons\modern-install.ico"
+!define MUI_UNICON "${NSISDIR}\Contrib\Graphics\Icons\modern-uninstall.ico"
+@@FINISH_PAGE_OPTIONS@@
+
+; Variables for component install directories
+Var DockerCheckCode
+Var PortCheckCode
+Var PortCheckPort
+Var VCRedistInstalled
+Var VCRedistInstallCode
+Var VCRedistVersion
+Var ExistingBuckyRoot
+Var BestInstallDrive
+Var LaunchAfterInstall
+Var InstallerLogPath
+@@COMPONENT_VARIABLES@@
+
+; Custom directory page variables
+Var Dialog
+Var Label
+@@DIRECTORY_VARIABLES@@
+
+; Installer pages
+!insertmacro MUI_PAGE_WELCOME
+@@LICENSE_PAGE@@
+!insertmacro MUI_PAGE_COMPONENTS
+Page custom DirectoryPageCreate DirectoryPageLeave
+!insertmacro MUI_PAGE_INSTFILES
+!insertmacro MUI_PAGE_FINISH
+
+; Uninstaller pages
+!insertmacro MUI_UNPAGE_CONFIRM
+!insertmacro MUI_UNPAGE_INSTFILES
+
+; Language
+!insertmacro MUI_LANGUAGE "English"
+
+; Custom directory page - allows selecting install path for each component
+Function DirectoryPageCreate
+  !insertmacro MUI_HEADER_TEXT "Choose Install Locations" "Choose the folder in which to install each component."
+  nsDialogs::Create 1018
+  Pop $Dialog
+  ${If} $Dialog == error
+    Abort
+  ${EndIf}
+
+@@DIRECTORY_CONTROLS@@
+  nsDialogs::Show
+FunctionEnd
+
+@@BROWSE_CALLBACKS@@
+Function DirectoryPageLeave
+@@DIRECTORY_LEAVE@@
+FunctionEnd
+
+; Runtime dependency checks
+Function CheckDockerDesktopForUser
+  StrCpy $DockerCheckCode "0"
+  nsExec::Exec 'cmd /c "docker --version >nul 2>nul"'
+  Pop $0
+  ${If} $0 != 0
+    StrCpy $DockerCheckCode "1"
+    Return
+  ${EndIf}
+  nsExec::Exec 'cmd /c "docker version >nul 2>nul"'
+  Pop $0
+  ${If} $0 != 0
+    StrCpy $DockerCheckCode "2"
+    Return
+  ${EndIf}
+FunctionEnd
+
+Function CheckRequiredPorts
+  StrCpy $PortCheckCode "0"
+  StrCpy $PortCheckPort ""
+  nsExec::ExecToStack 'powershell.exe -NoProfile -ExecutionPolicy Bypass -Command "$$p=3180; try { $$used=[System.Net.NetworkInformation.IPGlobalProperties]::GetIPGlobalProperties().GetActiveTcpListeners().Port -contains $$p; if ($$used) { exit 1 }; exit 0 } catch { exit 1 }"'
+  Pop $0
+  ${If} $0 != 0
+    StrCpy $PortCheckCode "1"
+    StrCpy $PortCheckPort "3180"
+    Return
+  ${EndIf}
+  nsExec::ExecToStack 'powershell.exe -NoProfile -ExecutionPolicy Bypass -Command "$$p=80; try { $$used=[System.Net.NetworkInformation.IPGlobalProperties]::GetIPGlobalProperties().GetActiveTcpListeners().Port -contains $$p; if ($$used) { exit 1 }; exit 0 } catch { exit 1 }"'
+  Pop $0
+  ${If} $0 != 0
+    StrCpy $PortCheckCode "1"
+    StrCpy $PortCheckPort "80"
+    Return
+  ${EndIf}
+  nsExec::ExecToStack 'powershell.exe -NoProfile -ExecutionPolicy Bypass -Command "$$p=443; try { $$used=[System.Net.NetworkInformation.IPGlobalProperties]::GetIPGlobalProperties().GetActiveTcpListeners().Port -contains $$p; if ($$used) { exit 1 }; exit 0 } catch { exit 1 }"'
+  Pop $0
+  ${If} $0 != 0
+    StrCpy $PortCheckCode "1"
+    StrCpy $PortCheckPort "443"
+    Return
+  ${EndIf}
+FunctionEnd
+
+Function IsVCRedistInstalled
+  StrCpy $VCRedistInstalled "0"
+  StrCpy $VCRedistVersion ""
+  ReadRegDWORD $0 HKLM "SOFTWARE\Microsoft\VisualStudio\14.0\VC\Runtimes\x64" "Installed"
+  ${If} $0 == 1
+    StrCpy $VCRedistInstalled "1"
+    ReadRegStr $VCRedistVersion HKLM "SOFTWARE\Microsoft\VisualStudio\14.0\VC\Runtimes\x64" "Version"
+    Return
+  ${EndIf}
+  ReadRegDWORD $0 HKLM "SOFTWARE\WOW6432Node\Microsoft\VisualStudio\14.0\VC\Runtimes\x64" "Installed"
+  ${If} $0 == 1
+    StrCpy $VCRedistInstalled "1"
+    ReadRegStr $VCRedistVersion HKLM "SOFTWARE\WOW6432Node\Microsoft\VisualStudio\14.0\VC\Runtimes\x64" "Version"
+    Return
+  ${EndIf}
+FunctionEnd
+
+@@VCREDIST_FUNCTIONS@@
+Function ExtractBundledStopScript
+  InitPluginsDir
+  SetOutPath "$PLUGINSDIR"
+@@BUNDLED_STOP_SCRIPT@@
+FunctionEnd
+
+Function FindExistingBuckyOSRoot
+  StrCpy $ExistingBuckyRoot ""
+  ReadRegStr $ExistingBuckyRoot HKCU "Environment" "BUCKYOS_ROOT"
+  ${If} $ExistingBuckyRoot == ""
+    ReadRegStr $ExistingBuckyRoot HKCU "Software\BuckyOS" "InstallDir"
+  ${EndIf}
+  ${If} $ExistingBuckyRoot == ""
+    ; Backward compatibility with previous system-service installations
+    ReadRegStr $ExistingBuckyRoot HKLM "SYSTEM\CurrentControlSet\Control\Session Manager\Environment" "BUCKYOS_ROOT"
+  ${EndIf}
+  ${If} $ExistingBuckyRoot == ""
+    ReadRegStr $ExistingBuckyRoot HKLM "Software\BuckyOS" "BuckyOSServiceDir"
+  ${EndIf}
+FunctionEnd
+
+Function StopExistingBuckyOS
+  Call FindExistingBuckyOSRoot
+  nsExec::Exec 'cmd /c "schtasks /Query /TN BuckyOSNodeDaemonKeepAlive >nul 2>&1 && schtasks /Delete /TN BuckyOSNodeDaemonKeepAlive /F >nul 2>&1"'
+  Pop $0
+  DeleteRegValue HKCU "Software\Microsoft\Windows\CurrentVersion\Run" "BuckyOSDaemon"
+  Push $ExistingBuckyRoot
+  Call RunStopScript
+  ${If} $ExistingBuckyRoot != ""
+    ; Backward compatibility: stop/remove legacy Windows service if present
+    nsExec::ExecToLog 'sc stop buckyos'
+    Sleep 2000
+    nsExec::ExecToLog 'sc delete buckyos'
+  ${EndIf}
+FunctionEnd
+
+Function RunStopScript
+  Exch $0
+  IfFileExists "$PLUGINSDIR\stop.ps1" stop_script_exists stop_script_missing
+stop_script_exists:
+  nsExec::ExecToLog 'powershell.exe -NoProfile -ExecutionPolicy Bypass -File "$PLUGINSDIR\stop.ps1"'
+  Return
+stop_script_missing:
+  nsExec::ExecToLog 'taskkill /F /IM node_daemon.exe'
+FunctionEnd
+
+Function un.RunStopScript
+  Exch $0
+  ${If} $0 == ""
+    Return
+  ${EndIf}
+  IfFileExists "$0\bin\stop.ps1" un.stop_script_exists un.stop_script_missing
+un.stop_script_exists:
+  nsExec::ExecToLog 'powershell.exe -NoProfile -ExecutionPolicy Bypass -File "$0\bin\stop.ps1"'
+  Return
+un.stop_script_missing:
+  nsExec::ExecToLog 'taskkill /F /IM node_daemon.exe'
+FunctionEnd
+
+@@STOP_APP_FUNCTIONS@@
+Function SelectBestInstallDrive
+  StrCpy $BestInstallDrive "C:"
+  Delete "$TEMP\buckyos_best_drive.txt"
+  nsExec::ExecToLog 'powershell.exe -NoProfile -ExecutionPolicy Bypass -Command "$$d = Get-CimInstance Win32_LogicalDisk | Where-Object { $$_.DriveType -eq 3 -and $$_.FreeSpace -ne $$null } | Sort-Object FreeSpace -Descending | Select-Object -First 1 -ExpandProperty DeviceID; if ([string]::IsNullOrWhiteSpace($$d)) { $$d = ''C:'' }; Set-Content -Path ''$$env:TEMP\\buckyos_best_drive.txt'' -Value $$d -Encoding ASCII"'
+  IfFileExists "$TEMP\buckyos_best_drive.txt" +2 0
+    Return
+  FileOpen $0 "$TEMP\buckyos_best_drive.txt" r
+  IfErrors select_best_drive_done_read
+  FileRead $0 $1
+  FileClose $0
+select_best_drive_done_read:
+  Delete "$TEMP\buckyos_best_drive.txt"
+  StrCpy $1 $1 2
+  ${If} $1 != ""
+    StrCpy $BestInstallDrive $1
+  ${EndIf}
+FunctionEnd
+
+; Functions
+Function .onInit
+@@ARCH_INIT@@
+  ; Restore component locations before falling back to configured defaults
+@@COMPONENT_INIT@@
+  StrCpy $LaunchAfterInstall ""
+  StrCpy $InstallerLogPath "$TEMP\buckyos-windows-${PRODUCT_ARCH}-${PRODUCT_VERSION}.log"
+
+FunctionEnd
+
+@@LAUNCH_FUNCTION@@
+@@COMPONENT_SECTIONS@@
+; Section descriptions
+!insertmacro MUI_FUNCTION_DESCRIPTION_BEGIN
+@@COMPONENT_DESCRIPTIONS@@
+!insertmacro MUI_FUNCTION_DESCRIPTION_END
+
+Section "-PostInstall"
+  ; Write registry keys
+  WriteRegStr HKCU "Software\BuckyOS" "Version" "${PRODUCT_VERSION}"
+
+  ; Create uninstaller in first component directory
+  SetOutPath "@@FIRST_INSTALL_VAR@@"
+  WriteUninstaller "@@FIRST_INSTALL_VAR@@\uninstall.exe"
+
+  ; Add/Remove Programs entry
+  WriteRegStr HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\BuckyOS" "DisplayName" "${PRODUCT_NAME}"
+  WriteRegStr HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\BuckyOS" "UninstallString" "@@FIRST_INSTALL_VAR@@\uninstall.exe"
+  WriteRegStr HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\BuckyOS" "DisplayVersion" "${PRODUCT_VERSION}"
+  WriteRegStr HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\BuckyOS" "Publisher" "${PRODUCT_PUBLISHER}"
+  WriteRegStr HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\BuckyOS" "URLInfoAbout" "${PRODUCT_WEB_SITE}"
+  WriteRegDWORD HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\BuckyOS" "NoModify" 1
+  WriteRegDWORD HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\BuckyOS" "NoRepair" 1
+SectionEnd
+
+Section Uninstall
+@@UNINSTALL_REG_VIEW@@
+  StrCpy $InstallerLogPath "$TEMP\buckyos-windows-${PRODUCT_ARCH}-${PRODUCT_VERSION}-uninstall.log"
+@@UNINSTALL_STOP_APP@@
+  ; Stop old Windows service for backward compatibility
+  nsExec::ExecToLog 'sc stop buckyos'
+  Sleep 3000
+  nsExec::ExecToLog 'sc delete buckyos'
+
+  ; Remove shortcuts
+@@UNINSTALL_SHORTCUTS@@
+  RMDir "$SMPROGRAMS\BuckyOS"
+
+  ; Read install directories from registry and remove files
+@@UNINSTALL_COMPONENTS@@
+  ; Remove registry keys
+  DeleteRegKey HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\BuckyOS"
+  DeleteRegKey HKCU "Software\BuckyOS"
+  DeleteRegValue HKCU "Environment" "BUCKYOS_ROOT"
+  ; Broadcast environment change
+  SendMessage ${HWND_BROADCAST} ${WM_WININICHANGE} 0 "STR:Environment" /TIMEOUT=5000
+SectionEnd
+; @@template FINISH_PAGE_OPTIONS@@
+!define MUI_FINISHPAGE_RUN
+!define MUI_FINISHPAGE_RUN_TEXT "Launch @@NAME@@"
+!define MUI_FINISHPAGE_RUN_FUNCTION "LaunchInstalledApplication"
+; @@template DIRECTORY_CONTROLS@@
+  ; @@NAME@@ directory selection
+  ${NSD_CreateLabel} 0 @@LABEL_Y@@u 100% 12u "@@NAME@@ Install Location:"
+  Pop $Label
+  ${NSD_CreateDirRequest} 0 @@INPUT_Y@@u 78% 12u "@@INSTALL_VAR@@"
+  Pop @@DIRECTORY_VAR@@
+  ${NSD_CreateBrowseButton} 80% @@BUTTON_Y@@u 20% 14u "Browse..."
+  Pop $0
+  ${NSD_OnClick} $0 OnBrowse@@INDEX@@
+
+; @@template BROWSE_CALLBACKS@@
+Function OnBrowse@@INDEX@@
+  nsDialogs::SelectFolderDialog "Select Install Location for @@NAME@@" @@INSTALL_VAR@@
+  Pop $0
+  ${If} $0 != error
+    StrCpy @@INSTALL_VAR@@ $0
+    ${NSD_SetText} @@DIRECTORY_VAR@@ @@INSTALL_VAR@@
+  ${EndIf}
+FunctionEnd
+
+; @@template VCREDIST_FUNCTIONS@@
+Function ExtractBundledVCRedist
+  InitPluginsDir
+  SetOutPath "$PLUGINSDIR"
+  File /oname=vcredist_x64.exe "@@VCREDIST_PATH@@"
+FunctionEnd
+
+Function InstallBundledVCRedist
+  StrCpy $VCRedistInstallCode "missing"
+  IfFileExists "$PLUGINSDIR\vcredist_x64.exe" vcredist_install 0
+  Return
+vcredist_install:
+  ExecWait '"$PLUGINSDIR\vcredist_x64.exe" /install /quiet /norestart' $0
+  StrCpy $VCRedistInstallCode $0
+  StrCmp $VCRedistInstallCode 0 vcredist_install_ok
+  StrCmp $VCRedistInstallCode 1641 vcredist_install_reboot
+  StrCmp $VCRedistInstallCode 3010 vcredist_install_reboot
+  Call IsVCRedistInstalled
+  Return
+vcredist_install_reboot:
+  SetRebootFlag true
+vcredist_install_ok:
+  StrCpy $VCRedistInstalled "1"
+FunctionEnd
+
+; @@template STOP_APP_FUNCTIONS@@
+Function @@FUNCTION_NAME@@
+  nsExec::Exec 'cmd /c "taskkill /F /T /IM buckyosapp.exe >nul 2>&1"'
+  Pop $0
+  ${If} $0 == 0
+    Sleep 500
+  ${EndIf}
+FunctionEnd
+
+; @@template ARCH_INIT@@
+  ; Check if running on 64-bit Windows
+  ${IfNot} ${RunningX64}
+    IfSilent silent_bad_arch interactive_bad_arch
+silent_bad_arch:
+    SetErrorLevel 10
+    Abort
+interactive_bad_arch:
+    MessageBox MB_OK|MB_ICONSTOP "This installer requires 64-bit Windows."
+    Abort
+  ${EndIf}
+  ; Use 64-bit registry view
+  SetRegView 64
+
+; @@template COMPONENT_INIT@@
+  ReadRegStr @@INSTALL_VAR@@ HKCU "Software\BuckyOS" "InstDir_@@KEY@@"
+@@SERVICE_ROOT_FALLBACK@@
+  ${If} @@INSTALL_VAR@@ == ""
+    StrCpy @@INSTALL_VAR@@ "@@DEFAULT_TARGET@@"
+  ${EndIf}
+; @@template LAUNCH_FUNCTION@@
+Function LaunchInstalledApplication
+  ${If} $LaunchAfterInstall == ""
+    Return
+  ${EndIf}
+  IfFileExists "$LaunchAfterInstall" +2 0
+    Return
+  ExecShell "open" "$LaunchAfterInstall"
+FunctionEnd
+
+; @@template COMPONENT_SECTIONS@@
+Section@@SECTION_FLAG@@ "@@NAME@@" @@SECTION_ID@@
+@@REQUIRED_SECTION@@
+@@PAYLOAD_INSTALL@@
+@@BUNDLE_INSTALL@@
+@@SERVICE_INSTALL@@
+@@POST_HOOK@@
+  WriteRegStr HKCU "Software\BuckyOS" "InstDir_@@KEY@@" "@@INSTALL_VAR@@"
+SectionEnd
+
+; @@template HOOK@@
+  ; Run @@KEY@@ @@STEP@@ hook
+  nsExec::ExecToLog '@@COMMAND@@'
+  Pop $0
+  ${If} $0 != 0
+    IfSilent silent_hook_failed_@@LABEL@@ interactive_hook_failed_@@LABEL@@
+silent_hook_failed_@@LABEL@@:
+    FileOpen $1 "$InstallerLogPath" a
+    FileWrite $1 "@@KEY@@ @@STEP@@ hook failed with exit code $0.$\r$\n"
+    FileClose $1
+    SetErrorLevel @@ERROR_CODE@@
+    Abort
+interactive_hook_failed_@@LABEL@@:
+    MessageBox MB_OK|MB_ICONSTOP "@@KEY@@ @@STEP@@ hook failed with exit code $0."
+    SetErrorLevel @@ERROR_CODE@@
+    Abort
+  ${EndIf}
+; @@template SERVICE_PREREQUISITES@@
+dep_check_@@LABEL@@:
+  ; Check Docker only for the selected service component
+  Call CheckDockerDesktopForUser
+  ${If} $DockerCheckCode != "0"
+    ${If} $DockerCheckCode == "1"
+      IfSilent silent_docker_missing interactive_docker_missing
+silent_docker_missing:
+      FileOpen $0 "$InstallerLogPath" a
+      FileWrite $0 "Docker CLI is required but was not found.$\r$\n"
+      FileClose $0
+      SetErrorLevel 20
+      Abort
+interactive_docker_missing:
+      MessageBox MB_ABORTRETRYIGNORE|MB_ICONSTOP "Docker Desktop is required.$\r$\nThe installer could not find the docker command in the current PATH.$\r$\n$\r$\nAbort=Cancel, Retry=Retry, Ignore=Open install guide." IDRETRY dep_check_@@LABEL@@ IDIGNORE open_docker_@@LABEL@@
+      Abort
+open_docker_@@LABEL@@:
+      ExecShell "open" "https://docs.docker.com/desktop/setup/install/windows-install/"
+      Goto dep_check_@@LABEL@@
+    ${Else}
+      IfSilent silent_docker_engine interactive_docker_engine
+silent_docker_engine:
+      FileOpen $0 "$InstallerLogPath" a
+      FileWrite $0 "Docker Engine is not reachable.$\r$\n"
+      FileClose $0
+      SetErrorLevel 21
+      Abort
+interactive_docker_engine:
+      MessageBox MB_RETRYCANCEL|MB_ICONSTOP "Docker Desktop was found, but Docker Engine is not reachable right now.$\r$\nPlease open Docker Desktop, wait until it finishes starting, then retry." IDRETRY dep_check_@@LABEL@@
+      Abort
+    ${EndIf}
+  ${EndIf}
+
+  ; Check Visual C++ runtime only for the selected service component
+  Call IsVCRedistInstalled
+  ${If} $VCRedistInstalled != "1"
+@@VCREDIST_CHECK@@
+  ${EndIf}
+dep_check_@@LABEL@@_done:
+
+  ; Stop existing service and running processes before overwrite
+  Call ExtractBundledStopScript
+  Call StopExistingBuckyOS
+  ; Check required ports only when installation actually starts
+port_check_@@LABEL@@:
+  Call CheckRequiredPorts
+  ${If} $PortCheckCode != "0"
+    IfSilent silent_port_busy interactive_port_busy
+silent_port_busy:
+    FileOpen $0 "$InstallerLogPath" a
+    FileWrite $0 "Required port $PortCheckPort is busy.$\r$\n"
+    FileClose $0
+    SetErrorLevel 40
+    Abort
+interactive_port_busy:
+    MessageBox MB_RETRYCANCEL|MB_ICONSTOP "Required port $PortCheckPort cannot be bound.$\r$\nPlease free ports 3180, 80, and 443 before installing." IDRETRY port_check_@@LABEL@@
+    Abort
+  ${EndIf}
+; @@template VCREDIST_CHECK_BUNDLED@@
+    Call ExtractBundledVCRedist
+    Call InstallBundledVCRedist
+    ${If} $VCRedistInstalled != "1"
+      IfSilent silent_vcredist_failed_@@LABEL@@ interactive_vcredist_failed_@@LABEL@@
+silent_vcredist_failed_@@LABEL@@:
+      FileOpen $0 "$InstallerLogPath" a
+      FileWrite $0 "Visual C++ 2015-2022 x64 runtime installation failed with return code $VCRedistInstallCode.$\r$\n"
+      FileClose $0
+      SetErrorLevel 30
+      Abort
+interactive_vcredist_failed_@@LABEL@@:
+      MessageBox MB_OK|MB_ICONSTOP "Visual C++ Redistributable installation failed, return code: $VCRedistInstallCode. Installation aborted."
+      SetErrorLevel 30
+      Abort
+    ${EndIf}
+; @@template VCREDIST_CHECK_MISSING@@
+    IfSilent silent_vcredist_missing interactive_vcredist_missing
+silent_vcredist_missing:
+    FileOpen $0 "$InstallerLogPath" a
+    FileWrite $0 "Visual C++ 2015-2022 x64 runtime is missing.$\r$\n"
+    FileClose $0
+    SetErrorLevel 30
+    Abort
+interactive_vcredist_missing:
+    MessageBox MB_ABORTRETRYIGNORE|MB_ICONSTOP "Visual C++ 2015-2022 (x64) runtime is required.$\r$\nAbort=Cancel, Retry=Retry, Ignore=Open Microsoft download page." IDRETRY dep_check_@@LABEL@@ IDIGNORE open_vcredist_@@LABEL@@
+    Abort
+open_vcredist_@@LABEL@@:
+    ExecShell "open" "https://aka.ms/vs/17/release/vc_redist.x64.exe"
+    Goto dep_check_@@LABEL@@
+; @@template SERVICE_INSTALL@@
+
+  ; Set BUCKYOS_ROOT environment variable
+  WriteRegStr HKCU "Environment" "BUCKYOS_ROOT" "@@INSTALL_VAR@@"
+  WriteRegStr HKCU "Software\BuckyOS" "InstallDir" "@@INSTALL_VAR@@"
+  ; Broadcast environment change
+  SendMessage ${HWND_BROADCAST} ${WM_WININICHANGE} 0 "STR:Environment" /TIMEOUT=5000
+
+  ; Run seed defaults script
+  nsExec::ExecToLog 'powershell.exe -ExecutionPolicy Bypass -File "@@INSTALL_VAR@@\scripts\seed_defaults.ps1"'
+  ; Allow installed service executables through Windows Firewall before first launch
+  nsExec::ExecToLog 'powershell.exe -NoProfile -ExecutionPolicy Bypass -File "@@INSTALL_VAR@@\scripts\ensure_firewall_rules.ps1"'
+
+  ; Save install directory to registry
+  WriteRegStr HKCU "Software\BuckyOS" "BuckyOSUserDir" "@@INSTALL_VAR@@"
+; @@template BUNDLE_INSTALL@@
+
+  ; Create Start Menu shortcut
+  CreateDirectory "$SMPROGRAMS\BuckyOS"
+  CreateShortcut "$SMPROGRAMS\BuckyOS\@@NAME@@.lnk" "@@INSTALL_VAR@@\@@EXE_NAME@@" "" "@@INSTALL_VAR@@\@@EXE_NAME@@" 0
+
+  ; Create Desktop shortcut
+  CreateShortcut "$DESKTOP\@@NAME@@.lnk" "@@INSTALL_VAR@@\@@EXE_NAME@@" "" "@@INSTALL_VAR@@\@@EXE_NAME@@" 0
+
+  ; Launch the UI app from the finish page after installation completes
+  StrCpy $LaunchAfterInstall "@@INSTALL_VAR@@\@@EXE_NAME@@"
+; @@template PAYLOAD_INSTALL@@
+@@STOP_APP@@
+@@SERVICE_PREREQUISITES@@
+@@PRE_HOOK@@
+  SetOutPath "@@INSTALL_VAR@@"
+  File /r "@@PAYLOAD_PATH@@\*.*"
+; @@template UNINSTALL_COMPONENTS@@
+  ReadRegStr @@INSTALL_VAR@@ HKCU "Software\BuckyOS" "InstDir_@@KEY@@"
+  ${If} @@INSTALL_VAR@@ != ""
+@@PREUNINSTALL_HOOK@@
+@@REMOVE_COMPONENT@@
+  ${EndIf}
+
+; @@template SERVICE_UNINSTALL@@
+    ; Stop running processes and old service for service component
+    nsExec::ExecToLog 'sc stop buckyos'
+    Sleep 3000
+    nsExec::ExecToLog 'sc delete buckyos'
+    Push @@INSTALL_VAR@@
+    Call un.RunStopScript
+    ; Run cleanup script for service component
+    nsExec::ExecToLog 'powershell.exe -ExecutionPolicy Bypass -File "@@INSTALL_VAR@@\scripts\uninstall_cleanup.ps1"'
+    RMDir /r "@@INSTALL_VAR@@\.buckyos_installer_defaults"
+    RMDir /r "@@INSTALL_VAR@@\scripts"
+    MessageBox MB_YESNO|MB_ICONQUESTION "Do you want to delete your data and identity?" IDYES +2
+    Goto +2
+    RMDir /r "@@INSTALL_VAR@@"
+; @@template SERVICE_ROOT_FALLBACK@@
+  ${If} @@INSTALL_VAR@@ == ""
+    Call FindExistingBuckyOSRoot
+    StrCpy @@INSTALL_VAR@@ $ExistingBuckyRoot
+  ${EndIf}

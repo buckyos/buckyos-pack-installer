@@ -10,6 +10,61 @@ import make_local_win_installer as winpkg  # noqa: E402
 
 
 class WindowsPackagerTests(unittest.TestCase):
+    def test_reinstall_restores_each_component_directory_before_using_defaults(self) -> None:
+        for architecture in ("amd64", "arm64"):
+            with self.subTest(architecture=architecture), tempfile.TemporaryDirectory() as td:
+                root = Path(td)
+                components = [
+                    winpkg.PublishComponent(
+                        key="buckyos", name="BuckyOS Service", kind="app",
+                        optional=True, default_selected=True, src=None,
+                        default_target="C:\\BuckyOS", system_service=True,
+                    ),
+                    winpkg.PublishComponent(
+                        key="BuckyOSApp", name="BuckyOS App", kind="bundle",
+                        optional=True, default_selected=True, src="buckyosapp.exe",
+                        default_target="C:\\BuckyOS\\BuckyOSApp", system_service=False,
+                    ),
+                ]
+                for comp in components:
+                    (root / "payload" / comp.key).mkdir(parents=True)
+                out_path = root / "installer.nsi"
+                winpkg.generate_nsis_script(
+                    title="BuckyOS", version="0.7.0+test", architecture=architecture,
+                    components=components, payload_dir=root / "payload", out_path=out_path,
+                )
+                script = out_path.read_text(encoding="utf-8-sig")
+                init = script.split("Function .onInit\n", 1)[1].split("FunctionEnd", 1)[0]
+                for comp in components:
+                    var = f"$InstDir_{comp.key.lower()}"
+                    # Read the exact per-component key written by the previous installer.
+                    registry_key = f'HKCU "Software\\BuckyOS" "InstDir_{comp.key}"'
+                    self.assertIn(f'WriteRegStr {registry_key} "{var}"', script)
+                    self.assertIn(f"ReadRegStr {var} {registry_key}", init)
+                    default = winpkg._escape_nsis_string(winpkg._nsis_default_target(comp))
+                    self.assertIn(
+                        f'  ${{If}} {var} == ""\n'
+                        f'    StrCpy {var} "{default}"\n'
+                        '  ${EndIf}',
+                        init,
+                    )
+                    self.assertIn(f'78% 12u "{var}"', script)
+                self.assertIn(
+                    '  ${If} $InstDir_buckyos == ""\n'
+                    '    Call FindExistingBuckyOSRoot\n'
+                    '    StrCpy $InstDir_buckyos $ExistingBuckyRoot\n'
+                    '  ${EndIf}',
+                    init,
+                )
+                self.assertEqual(init.count("Call FindExistingBuckyOSRoot"), 1)
+                self.assertNotIn("Call StopExistingBuckyOS", init)
+                if architecture == "amd64":
+                    self.assertLess(init.index("SetRegView 64"), init.index("ReadRegStr"))
+                discovery = script.split("Function FindExistingBuckyOSRoot\n", 1)[1].split("FunctionEnd", 1)[0]
+                self.assertIn('HKCU "Environment" "BUCKYOS_ROOT"', discovery)
+                self.assertIn('HKLM "SYSTEM\\CurrentControlSet\\Control\\Session Manager\\Environment" "BUCKYOS_ROOT"', discovery)
+                self.assertNotIn("nsExec::", discovery)
+
     def test_windows_cmd_fallback_keeps_cmd_filename(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
