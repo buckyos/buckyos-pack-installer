@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 from pathlib import Path
 from typing import Any, Iterable, Sequence
@@ -270,3 +271,76 @@ def discover_component_hook(
                     raise ValueError(f"component hook must be a regular file: {candidate}")
                 return candidate
     return None
+
+
+PAIOS_IMAGES_MANIFEST = "paios_images.json"
+
+
+def package_arch_from_name(file_name: str) -> str:
+    """Architecture from a package_filename() style name, e.g. buckyos-macos-arm64-<version>.pkg."""
+    for part in file_name.split("-"):
+        if part.lower() in ("amd64", "x86_64", "arm64", "aarch64"):
+            return canonical_arch(part)
+    raise ValueError(f"cannot tell the architecture of {file_name}")
+
+
+def paios_images_arch(raw_arch: str) -> str:
+    """Architecture key used by bin/paios-images/paios_images.json."""
+    return "aarch64" if canonical_arch(raw_arch) == "arm64" else "amd64"
+
+
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for block in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def verify_paios_images(extract_root: Path, raw_arch: str, failures: list[str], *, required: bool) -> None:
+    """Check bundled paios image tarballs against bin/paios-images/paios_images.json.
+
+    Release payloads pin the worker/ExtTool images; node_daemon never pulls them and
+    loads a missing image from the tarball next to the manifest. Files are located by
+    name because some extractors (NSIS) flatten directories.
+    """
+    manifests = [path for path in extract_root.rglob(PAIOS_IMAGES_MANIFEST) if path.is_file()]
+    if not manifests:
+        if required:
+            failures.append(f"payload has no bin/paios-images/{PAIOS_IMAGES_MANIFEST}")
+        return
+    if len(manifests) > 1:
+        failures.append(f"payload has {len(manifests)} copies of {PAIOS_IMAGES_MANIFEST}")
+        return
+    try:
+        manifest = json.loads(manifests[0].read_text(encoding="utf-8"))
+        images = manifest["images"]
+        if manifest.get("schema") != "buckyos.paios-images/v1" or "aios" not in images:
+            raise ValueError("unsupported schema or missing images.aios")
+    except (OSError, ValueError, KeyError, TypeError) as error:
+        failures.append(f"invalid {PAIOS_IMAGES_MANIFEST}: {error}")
+        return
+    arch = paios_images_arch(raw_arch)
+    for name, image in images.items():
+        entry = (image.get("platforms") or {}).get(arch) if isinstance(image, dict) else None
+        if not isinstance(entry, dict) or not isinstance(entry.get("tar"), dict):
+            failures.append(f"{PAIOS_IMAGES_MANIFEST} has no {arch} entry for {name}")
+            continue
+        tar = entry["tar"]
+        file_name = str(tar.get("file", ""))
+        if not file_name or "/" in file_name or "\\" in file_name or ".." in file_name:
+            failures.append(f"{PAIOS_IMAGES_MANIFEST} {name}.{arch} has an invalid tar.file {file_name!r}")
+            continue
+        candidate = manifests[0].parent / file_name
+        if not candidate.is_file():
+            matches = [path for path in extract_root.rglob(file_name) if path.is_file()]
+            candidate = matches[0] if len(matches) == 1 else None
+        if candidate is None:
+            if required:
+                failures.append(f"payload is missing paios image tarball {file_name} ({name} {arch})")
+            continue
+        size = candidate.stat().st_size
+        if size != tar.get("size") or _sha256_file(candidate) != tar.get("sha256"):
+            failures.append(f"paios image tarball {file_name} does not match {PAIOS_IMAGES_MANIFEST}")
+        else:
+            print(f"[verify] paios image {name} {arch}: {file_name} ({size / (1024 * 1024):.1f} MB) OK")

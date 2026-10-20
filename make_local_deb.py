@@ -698,6 +698,7 @@ def verify_pkg(
     pkg_path: Path,
     project_yaml_path: Path,
     manifest_path: Path | None = None,
+    require_paios_images: bool = False,
 ) -> int:
     """
     Verify a built Debian package using dpkg-deb.
@@ -723,6 +724,8 @@ def verify_pkg(
     except Exception:
         dpkg_deb_ok = False
         print("[verify] Warning: dpkg-deb not found, skipping payload inspection")
+        if require_paios_images:
+            failures.append("dpkg-deb is required to verify paios image tarballs")
 
     if dpkg_deb_ok:
         with tempfile.TemporaryDirectory(prefix="buckyos-deb-verify-") as td:
@@ -766,6 +769,12 @@ def verify_pkg(
                     failures=failures,
                     package_kind="deb",
                     include_systemd_service=False,
+                )
+                common.verify_paios_images(
+                    extract_dir,
+                    _deb_control_field(pkg_path, "Architecture"),
+                    failures,
+                    required=require_paios_images,
                 )
 
             try:
@@ -1005,6 +1014,7 @@ def main(argv: List[str]) -> int:
     p_verify.add_argument("pkg", help="Path to .deb")
     p_verify.add_argument("--project", default=str(PROJECT_YAML), help="Path to bucky_project.yaml")
     p_verify.add_argument("--manifest", default=None, help="Path to generated project manifest JSON")
+    p_verify.add_argument("--require-paios-images", action="store_true", help="Fail unless bin/paios-images/ carries the manifest and the target-arch image tarballs")
 
     for name in ("install", "update", "uninstall"):
         p = sub.add_parser(name, help=f"Local filesystem action: {name}")
@@ -1057,6 +1067,7 @@ def main(argv: List[str]) -> int:
             pkg_path=Path(args.pkg).expanduser().resolve(),
             project_yaml_path=Path(args.project),
             manifest_path=Path(args.manifest).resolve() if args.manifest else None,
+            require_paios_images=bool(args.require_paios_images),
         )
 
     layout = resolve_app_layout(

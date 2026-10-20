@@ -189,5 +189,59 @@ class PackageCommonTests(unittest.TestCase):
         self.assertEqual(unexpected, ["opt/buckyos/data/user.db"])
 
 
+    def test_verify_paios_images(self) -> None:
+        import hashlib
+
+        def manifest(entries: dict[str, tuple[str, bytes]]) -> dict:
+            return {
+                "schema": "buckyos.paios-images/v1",
+                "images": {
+                    name: {"platforms": {"aarch64": {"tar": {
+                        "file": file_name, "size": len(data), "sha256": hashlib.sha256(data).hexdigest()}}}}
+                    for name, (file_name, data) in entries.items()
+                },
+            }
+
+        entries = {"aios": ("aios-aarch64-1.tar.gz", b"aios"), "exttool": ("exttool-aarch64-2.tar.gz", b"ext")}
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            failures: list[str] = []
+            common.verify_paios_images(root, "arm64", failures, required=False)
+            self.assertEqual(failures, [])
+            common.verify_paios_images(root, "arm64", failures, required=True)
+            self.assertEqual(len(failures), 1)
+
+            images_dir = root / "opt/buckyos/bin/paios-images"
+            images_dir.mkdir(parents=True)
+            (images_dir / "paios_images.json").write_text(json.dumps(manifest(entries)), encoding="utf-8")
+            failures = []
+            common.verify_paios_images(root, "aarch64", failures, required=False)
+            self.assertEqual(failures, [])
+            common.verify_paios_images(root, "aarch64", failures, required=True)
+            self.assertEqual(len(failures), 2)
+
+            (images_dir / "aios-aarch64-1.tar.gz").write_bytes(b"aios")
+            flattened = root / "flattened"
+            flattened.mkdir()
+            (flattened / "exttool-aarch64-2.tar.gz").write_bytes(b"ext")
+            failures = []
+            common.verify_paios_images(root, "arm64", failures, required=True)
+            self.assertEqual(failures, [])
+
+            (images_dir / "aios-aarch64-1.tar.gz").write_bytes(b"aiox")
+            common.verify_paios_images(root, "arm64", failures, required=True)
+            self.assertEqual(len(failures), 1)
+            self.assertIn("does not match", failures[0])
+
+            failures = []
+            common.verify_paios_images(root, "amd64", failures, required=True)
+            self.assertEqual(len(failures), 2)
+
+    def test_package_arch_from_name(self) -> None:
+        self.assertEqual(common.package_arch_from_name("buckyos-macos-arm64-0.7.0+build261020.pkg"), "arm64")
+        self.assertEqual(common.package_arch_from_name("buckyos-windows-amd64-0.7.0+build261020.exe"), "amd64")
+        with self.assertRaises(ValueError):
+            common.package_arch_from_name("buckyos.pkg")
+
 if __name__ == "__main__":
     unittest.main()

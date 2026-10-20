@@ -725,6 +725,7 @@ def verify_pkg(
     pkg_path: Path,
     project_yaml_path: Path,
     manifest_path: Path | None = None,
+    require_paios_images: bool = False,
 ) -> int:
     """
     Offline verification for the built macOS .pkg.
@@ -830,6 +831,27 @@ def verify_pkg(
 
         # Verify data_paths payload staging for buckyos.
         buckyos_pkg_dir = expanded / "buckyos.pkg"
+        if buckyos_pkg_dir.exists() and (buckyos_pkg_dir / "Payload").exists():
+            # bsdtar reads the gzip'd cpio Payload; only bin/paios-images/ is extracted.
+            paios_dir = work / "paios-images"
+            paios_dir.mkdir()
+            extracted = subprocess.run(
+                ["tar", "-xf", str(buckyos_pkg_dir / "Payload"), "-C", str(paios_dir),
+                 "--include", "*bin/paios-images/*"],
+                capture_output=True,
+                text=True,
+            )
+            if extracted.returncode != 0:
+                failures.append(f"buckyos Payload paios-images extraction failed: {extracted.stderr.strip()}")
+            else:
+                common.verify_paios_images(
+                    paios_dir,
+                    common.package_arch_from_name(pkg_path.name),
+                    failures,
+                    required=require_paios_images,
+                )
+        elif require_paios_images:
+            failures.append("buckyos.pkg Payload is missing; cannot verify paios image tarballs")
         if buckyos_pkg_dir.exists():
             layout = resolve_app_layout(
                 app_key="buckyos",
@@ -1312,6 +1334,7 @@ def main(argv: List[str]) -> int:
     p_verify.add_argument("pkg", help="Path to .pkg")
     p_verify.add_argument("--project", default=str(PROJECT_YAML), help="Path to bucky_project.yaml")
     p_verify.add_argument("--manifest", default=None, help="Path to generated project manifest JSON")
+    p_verify.add_argument("--require-paios-images", action="store_true", help="Fail unless bin/paios-images/ carries the manifest and the target-arch image tarballs")
 
     for name in ("install", "update", "uninstall"):
         p = sub.add_parser(name, help=f"Local filesystem action: {name}")
@@ -1355,6 +1378,7 @@ def main(argv: List[str]) -> int:
             pkg_path=Path(args.pkg).expanduser().resolve(),
             project_yaml_path=Path(args.project),
             manifest_path=Path(args.manifest).resolve() if args.manifest else None,
+            require_paios_images=bool(args.require_paios_images),
         )
 
     layout = resolve_app_layout(

@@ -980,6 +980,7 @@ def verify_pkg(
     pkg_path: Path,
     project_yaml_path: Path,
     manifest_path: Path | None = None,
+    require_paios_images: bool = False,
 ) -> int:
     """
     Verify a built Windows installer using 7zip.
@@ -1019,6 +1020,8 @@ def verify_pkg(
     if not sz_cmd:
         print("[verify] Warning: 7-Zip not found, skipping archive inspection")
         print("[verify] Install 7-Zip from https://www.7-zip.org/ for full verification")
+        if require_paios_images:
+            failures.append("7-Zip is required to verify paios image tarballs")
     else:
         with tempfile.TemporaryDirectory(prefix="buckyos-verify-") as td:
             work = Path(td)
@@ -1032,6 +1035,12 @@ def verify_pkg(
             if result.returncode != 0:
                 failures.append(f"Failed to extract installer: {result.stderr.decode()}")
             else:
+                common.verify_paios_images(
+                    extract_dir,
+                    common.package_arch_from_name(pkg_path.name),
+                    failures,
+                    required=require_paios_images,
+                )
                 extracted_basenames = {
                     path.name.lower()
                     for path in extract_dir.rglob("*")
@@ -1309,6 +1318,7 @@ def main(argv: List[str]) -> int:
     p_verify.add_argument("--pkg", required=True, help="Path to .exe installer")
     p_verify.add_argument("--project", default=str(PROJECT_YAML), help="Path to bucky_project.yaml")
     p_verify.add_argument("--manifest", default=None, help="Path to generated project manifest JSON")
+    p_verify.add_argument("--require-paios-images", action="store_true", help="Fail unless bin/paios-images/ carries the manifest and the target-arch image tarballs")
 
     # sync command
     p_sync = sub.add_parser("sync", help="Regenerate PowerShell scripts from bucky_project.yaml")
@@ -1339,6 +1349,7 @@ def main(argv: List[str]) -> int:
             pkg_path=Path(args.pkg).expanduser().resolve(),
             project_yaml_path=Path(args.project),
             manifest_path=Path(args.manifest).resolve() if args.manifest else None,
+            require_paios_images=bool(args.require_paios_images),
         )
 
     if args.cmd == "sync":

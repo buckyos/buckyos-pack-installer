@@ -19,6 +19,7 @@ import shlex
 import shutil
 import subprocess
 import sys
+import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, List
@@ -706,11 +707,33 @@ def _rpm_query(pkg_path: Path, args: List[str]) -> str:
     return result.stdout
 
 
+def _verify_rpm_paios_images(pkg_path: Path, arch: str, failures: List[str], *, required: bool) -> None:
+    if shutil.which("rpm2cpio") is None or shutil.which("cpio") is None:
+        failures.append("rpm2cpio and cpio are required to verify paios image tarballs")
+        return
+    with tempfile.TemporaryDirectory(prefix="buckyos-rpm-paios-") as td:
+        extract_dir = Path(td)
+        rpm2cpio = subprocess.Popen(["rpm2cpio", str(pkg_path)], stdout=subprocess.PIPE)
+        cpio = subprocess.run(
+            ["cpio", "-idm", "--quiet", "./opt/buckyos/bin/paios-images/*"],
+            stdin=rpm2cpio.stdout,
+            cwd=extract_dir,
+            capture_output=True,
+            text=True,
+        )
+        rpm2cpio.stdout.close()
+        if rpm2cpio.wait() != 0 or cpio.returncode != 0:
+            failures.append(f"rpm paios-images extraction failed: {cpio.stderr.strip()}")
+            return
+        common.verify_paios_images(extract_dir, arch or "amd64", failures, required=required)
+
+
 def verify_pkg(
     *,
     pkg_path: Path,
     project_yaml_path: Path,
     manifest_path: Path | None = None,
+    require_paios_images: bool = False,
 ) -> int:
     if not pkg_path.exists():
         print(f"VERIFY FAIL: .rpm not found: {pkg_path}")
@@ -732,7 +755,11 @@ def verify_pkg(
     rpm_cmd = shutil.which("rpm")
     if rpm_cmd is None:
         print("[verify] Warning: rpm command not found, skipping rpm metadata inspection")
+        if require_paios_images:
+            failures.append("rpm is required to verify paios image tarballs")
     else:
+        arch = ""
+        payload_paths: List[str] = []
         try:
             metadata = _rpm_query(pkg_path, ["-qp", "--qf", "%{NAME}\n%{VERSION}\n%{RELEASE}\n%{ARCH}\n"])
             meta_lines = metadata.splitlines()
@@ -768,6 +795,9 @@ def verify_pkg(
             )
         except subprocess.CalledProcessError as err:
             failures.append(err.stderr.strip() or "rpm payload listing failed")
+
+        if require_paios_images or any(path.endswith("/bin/paios-images/" + common.PAIOS_IMAGES_MANIFEST) for path in payload_paths):
+            _verify_rpm_paios_images(pkg_path, arch, failures, required=require_paios_images)
 
         try:
             scripts_text = _rpm_query(pkg_path, ["-qp", "--scripts"])
@@ -861,6 +891,7 @@ def main(argv: List[str]) -> int:
     p_verify.add_argument("pkg", help="Path to .rpm")
     p_verify.add_argument("--project", default=str(PROJECT_YAML), help="Path to bucky_project.yaml")
     p_verify.add_argument("--manifest", default=None, help="Path to generated project manifest JSON")
+    p_verify.add_argument("--require-paios-images", action="store_true", help="Fail unless bin/paios-images/ carries the manifest and the target-arch image tarballs")
 
     args = parser.parse_args(argv[1:])
 
@@ -883,6 +914,7 @@ def main(argv: List[str]) -> int:
             pkg_path=Path(args.pkg).expanduser().resolve(),
             project_yaml_path=Path(args.project),
             manifest_path=Path(args.manifest).resolve() if args.manifest else None,
+            require_paios_images=bool(args.require_paios_images),
         )
 
     return 1
