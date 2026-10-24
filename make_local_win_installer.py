@@ -43,7 +43,8 @@ PROJECT_YAML = SRC_DIR / "bucky_project.yaml"
 RESULT_ROOT_DIR = Path(os.environ.get("BUCKYOS_BUILD_ROOT", "C:\\opt\\buckyosci"))
 TMP_INSTALL_DIR = RESULT_ROOT_DIR / "win-installer"
 
-WIN_PKG_PROJECT_DIR = SRC_DIR / "publish" / "win_pkg"
+# Resources travel with this repository, including standalone/submodule layouts.
+WIN_PKG_PROJECT_DIR = Path(__file__).resolve().parent / "win_pkg"
 BUCKYOS_DEFAULTS_SUBDIR = ".buckyos_installer_defaults"
 IGNORED_STAGE_NAMES = {".DS_Store", "__pycache__"}
 WINDOWS_HOOK_EXTENSIONS = (".ps1", ".bat", ".cmd")

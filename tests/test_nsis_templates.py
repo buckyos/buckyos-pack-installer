@@ -9,6 +9,14 @@ import make_local_win_installer as winpkg  # noqa: E402
 
 
 class NSISTemplateTests(unittest.TestCase):
+    def test_resources_resolve_next_to_packager(self) -> None:
+        resources = Path(winpkg.__file__).resolve().parent / "win_pkg"
+        self.assertEqual(winpkg.WIN_PKG_PROJECT_DIR, resources)
+        templates = winpkg._NSISTemplates(resources / "installer.nsi.in")
+        self.assertIn("INSTALLER", templates.sections)
+        self.assertTrue((resources / "license.txt").is_file())
+        self.assertTrue((resources / "scripts/buckyos_postinstall.ps1").is_file())
+
     def test_substitution_preserves_nsis_syntax_and_does_not_rescan_values(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             path = Path(td) / "installer.nsi.in"
