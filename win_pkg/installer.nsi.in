@@ -157,13 +157,6 @@ Function FindExistingBuckyOSRoot
   ${If} $ExistingBuckyRoot == ""
     ReadRegStr $ExistingBuckyRoot HKCU "Software\BuckyOS" "InstallDir"
   ${EndIf}
-  ${If} $ExistingBuckyRoot == ""
-    ; Backward compatibility with previous system-service installations
-    ReadRegStr $ExistingBuckyRoot HKLM "SYSTEM\CurrentControlSet\Control\Session Manager\Environment" "BUCKYOS_ROOT"
-  ${EndIf}
-  ${If} $ExistingBuckyRoot == ""
-    ReadRegStr $ExistingBuckyRoot HKLM "Software\BuckyOS" "BuckyOSServiceDir"
-  ${EndIf}
 FunctionEnd
 
 Function StopExistingBuckyOS
@@ -173,12 +166,6 @@ Function StopExistingBuckyOS
   DeleteRegValue HKCU "Software\Microsoft\Windows\CurrentVersion\Run" "BuckyOSDaemon"
   Push $ExistingBuckyRoot
   Call RunStopScript
-  ${If} $ExistingBuckyRoot != ""
-    ; Backward compatibility: stop/remove legacy Windows service if present
-    nsExec::ExecToLog 'sc stop buckyos'
-    Sleep 2000
-    nsExec::ExecToLog 'sc delete buckyos'
-  ${EndIf}
 FunctionEnd
 
 Function RunStopScript
@@ -262,11 +249,6 @@ Section Uninstall
 @@UNINSTALL_REG_VIEW@@
   StrCpy $InstallerLogPath "$TEMP\buckyos-windows-${PRODUCT_ARCH}-${PRODUCT_VERSION}-uninstall.log"
 @@UNINSTALL_STOP_APP@@
-  ; Stop old Windows service for backward compatibility
-  nsExec::ExecToLog 'sc stop buckyos'
-  Sleep 3000
-  nsExec::ExecToLog 'sc delete buckyos'
-
   ; Remove shortcuts
 @@UNINSTALL_SHORTCUTS@@
   RMDir "$SMPROGRAMS\BuckyOS"
@@ -523,10 +505,7 @@ open_vcredist_@@LABEL@@:
   ${EndIf}
 
 ; @@template SERVICE_UNINSTALL@@
-    ; Stop running processes and old service for service component
-    nsExec::ExecToLog 'sc stop buckyos'
-    Sleep 3000
-    nsExec::ExecToLog 'sc delete buckyos'
+    ; Stop running processes for service component
     Push @@INSTALL_VAR@@
     Call un.RunStopScript
     ; Run cleanup script for service component

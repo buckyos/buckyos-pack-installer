@@ -62,7 +62,8 @@ class WindowsPackagerTests(unittest.TestCase):
                     self.assertLess(init.index("SetRegView 64"), init.index("ReadRegStr"))
                 discovery = script.split("Function FindExistingBuckyOSRoot\n", 1)[1].split("FunctionEnd", 1)[0]
                 self.assertIn('HKCU "Environment" "BUCKYOS_ROOT"', discovery)
-                self.assertIn('HKLM "SYSTEM\\CurrentControlSet\\Control\\Session Manager\\Environment" "BUCKYOS_ROOT"', discovery)
+                self.assertNotIn("HKLM", discovery)
+                self.assertNotIn("sc stop buckyos", script)
                 self.assertNotIn("nsExec::", discovery)
 
     def test_windows_cmd_fallback_keeps_cmd_filename(self) -> None:
