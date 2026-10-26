@@ -244,6 +244,47 @@ class WindowsPackagerTests(unittest.TestCase):
             self.assertNotIn("TcpListener]::new", script)
             self.assertNotIn("IPAddress]::Any", script)
 
+    def test_lite_payload_installs_without_docker(self) -> None:
+        """BuckyOS Desktop Lite (etc/product.json) never requires Docker; the
+        full edition still checks it."""
+        lite = {"edition": "lite", "capabilities": {"container": False}}
+        for profile, expect_docker, expect_name in (
+            (None, True, "buckyos-windows-amd64-0.7.0+test.exe"),
+            (lite, False, "buckyos-lite-windows-amd64-0.7.0+test.exe"),
+        ):
+            with tempfile.TemporaryDirectory() as td:
+                root = Path(td)
+                payload = root / "payload"
+                (payload / "buckyos" / "etc").mkdir(parents=True)
+                if profile is not None:
+                    import json
+                    (payload / "buckyos" / "etc" / "product.json").write_text(json.dumps(profile), encoding="utf-8")
+                out_path = root / "installer.nsi"
+                winpkg.generate_nsis_script(
+                    title="BuckyOS",
+                    version="0.7.0+test",
+                    architecture="amd64",
+                    components=[
+                        winpkg.PublishComponent(
+                            key="buckyos",
+                            name="BuckyOS Service",
+                            kind="app",
+                            optional=True,
+                            default_selected=True,
+                            src=None,
+                            default_target="C:\\BuckyOS\\",
+                            system_service=True,
+                        )
+                    ],
+                    payload_dir=payload,
+                    out_path=out_path,
+                )
+                script = out_path.read_text(encoding="utf-8-sig")
+                self.assertEqual("Call CheckDockerDesktopForUser" in script, expect_docker)
+                self.assertEqual("Function CheckDockerDesktopForUser" in script, expect_docker)
+                self.assertIn(f'OutFile "{expect_name}"', script)
+                self.assertIn("Call IsVCRedistInstalled", script)
+
     def test_buckyos_postinstall_does_not_delete_missing_task(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             payload = Path(td) / "buckyos"

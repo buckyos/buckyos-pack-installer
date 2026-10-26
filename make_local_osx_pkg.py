@@ -502,6 +502,7 @@ def build_macos_distribution_pkg(
         pkgs_dir.mkdir(parents=True, exist_ok=True)
 
     base_identifier = "ai.buckyos"
+    edition = "full"
 
     built: List[Tuple[PublishComponent, str, str]] = []
     for comp in components:
@@ -576,6 +577,12 @@ def build_macos_distribution_pkg(
                 shutil.rmtree(scripts_dir, ignore_errors=True)
             if not dry_run:
                 _materialize_pkg_scripts_from_templates(comp.key, templates_dir, scripts_dir)
+                # The scripts read the package's product edition (preinstall:
+                # BuckyOS Desktop Lite needs no Docker).
+                product = src / "etc" / "product.json"
+                if comp.kind == "app" and product.is_file():
+                    shutil.copy2(product, scripts_dir / "product.json")
+                    edition = common.staged_product_edition(src)
                 cmd = cmd[:-1] + ["--scripts", str(scripts_dir)] + cmd[-1:]
 
         _run(cmd, dry_run=dry_run)
@@ -600,6 +607,7 @@ def build_macos_distribution_pkg(
         architecture=architecture,
         version=version,
         package_format="pkg",
+        edition=edition,
     )
 
     product_cmd = [
@@ -919,21 +927,25 @@ def verify_pkg(
                             failures.append(
                                 f"buckyos postinstall missing data_paths install step for '{rel}': {snippet}"
                             )
+                # node_daemon runs as BuckyOS Runtime.app in the desktop
+                # user's LaunchAgent, never as a root LaunchDaemon.
                 required_postinstall_snippets = [
-                    'start_buckyos_service',
+                    'start_buckyos_runtime',
                     'wait_for_node_daemon',
-                    'launchctl bootstrap system "$PLIST"',
-                    'launchctl kickstart -k "system/buckyos.service"',
-                    '/usr/bin/pgrep -f "${BUCKYOS_ROOT}/bin/node-daemon/node_daemon --enable_active"',
+                    'service register --root "$REAL_BUCKYOS_ROOT" --user "$user"',
+                    'service start --root "$REAL_BUCKYOS_ROOT"',
+                    'BuckyOS Runtime.app/Contents/MacOS/node_daemon',
                 ]
                 for snippet in required_postinstall_snippets:
                     if snippet not in postinstall_text:
                         failures.append(f"buckyos postinstall missing startup check step: {snippet}")
+                if "launchctl bootstrap system" in postinstall_text:
+                    failures.append("buckyos postinstall must not start a root LaunchDaemon")
 
                 data_block_end = postinstall_text.find("# END AUTO-GENERATED: data_paths")
-                start_call_idx = postinstall_text.rfind("\nstart_buckyos_service\n")
+                start_call_idx = postinstall_text.rfind("\nstart_buckyos_runtime\n")
                 if data_block_end != -1 and start_call_idx != -1 and start_call_idx < data_block_end:
-                    failures.append("buckyos postinstall should start LaunchDaemon only after data_paths setup")
+                    failures.append("buckyos postinstall should start the Runtime only after data_paths setup")
 
             preinstall_text = _pkg_script_text(buckyos_pkg_dir, "preinstall")
             if preinstall_text is None:
@@ -949,6 +961,19 @@ def verify_pkg(
                 for snippet in required_preinstall_snippets:
                     if snippet not in preinstall_text:
                         failures.append(f"buckyos preinstall missing Docker/OrbStack check: {snippet}")
+
+            # BuckyOS Desktop Lite: the scripts know the edition (no Docker
+            # check) and the payload carries no container images.
+            product_text = _pkg_script_text(buckyos_pkg_dir, "product.json")
+            if product_text is not None and json.loads(product_text).get("edition") == "lite":
+                if json.loads(product_text).get("capabilities", {}).get("container") is not False:
+                    failures.append("Lite product.json must disable containers")
+                payload_files = _pkg_payload_files(buckyos_pkg_dir)
+                if any("bin/paios-images/" in rel and not rel.endswith("/README.md") for rel in payload_files):
+                    failures.append("Lite package must not carry paios images")
+            if product_text is not None and not any(rel.endswith("opt/buckyos/etc/product.json")
+                                                    for rel in _pkg_payload_files(buckyos_pkg_dir)):
+                failures.append("buckyos payload has no etc/product.json")
 
         else:
             failures.append("missing embedded buckyos.pkg (cannot verify data_paths semantics)")

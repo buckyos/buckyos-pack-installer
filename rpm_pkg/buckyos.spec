@@ -11,7 +11,7 @@ Requires: python3
 Requires: curl
 Requires: openssl
 Requires: psmisc
-Requires: (moby-engine or docker-ce or docker-engine)
+{{docker_requires}}
 
 %global debug_package %{nil}
 # Keep prebuilt payload files unchanged after %install.

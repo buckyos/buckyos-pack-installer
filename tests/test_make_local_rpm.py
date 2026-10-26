@@ -55,6 +55,27 @@ class MakeLocalRpmTests(unittest.TestCase):
         self.assertNotIn("/etc/systemd/system/buckyos.service", files_section)
         self.assertIn('cp -a /tmp/buckyos-payload/. "%{buildroot}/"', spec)
 
+    def test_a_product_without_containers_does_not_require_docker(self) -> None:
+        layout = rpm.AppLayout(
+            source_rootfs=Path("/stage/buckyos"),
+            target_rootfs=Path("/opt/buckyos"),
+            module_paths=["bin/node-daemon/"],
+            data_paths=[],
+            clean_paths=[],
+            module_source_paths={},
+            data_source_paths={},
+        )
+        spec = rpm._render_spec(
+            rpm_version="0.7.0",
+            rpm_release="build261026",
+            payload_tree=Path("/tmp/buckyos-payload"),
+            layout=layout,
+            component_keys=["buckyos"],
+            runs_containers=False,
+        )
+        self.assertIn("Requires: psmisc", spec)
+        self.assertNotIn("docker", spec)
+
     def test_linux_hooks_are_discovered_from_rpm_pkg(self) -> None:
         hook = rpm._discover_linux_hook("buckyos", "preinstall")
 

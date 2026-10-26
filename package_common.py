@@ -74,15 +74,35 @@ def canonical_arch(raw_arch: str) -> str:
     raise ValueError(f"unsupported architecture: {raw_arch}")
 
 
-def package_filename(*, platform_key: str, architecture: str, version: str, package_format: str) -> str:
+def package_filename(
+    *, platform_key: str, architecture: str, version: str, package_format: str, edition: str = "full"
+) -> str:
     arch = canonical_arch(architecture)
+    # BuckyOS Desktop Lite is its own package: buckyos-lite-<platform>-...
+    product = "buckyos" if edition == "full" else f"buckyos-{edition}"
     if platform_key == "windows" and package_format == "exe":
-        return f"buckyos-windows-{arch}-{version}.exe"
+        return f"{product}-windows-{arch}-{version}.exe"
     if platform_key == "macos" and package_format == "pkg":
-        return f"buckyos-macos-{arch}-{version}.pkg"
+        return f"{product}-macos-{arch}-{version}.pkg"
     if platform_key == "linux" and package_format in ("deb", "rpm"):
-        return f"buckyos-linux-{arch}-{version}.{package_format}"
+        return f"{product}-linux-{arch}-{version}.{package_format}"
     raise ValueError(f"unsupported package target: {platform_key}/{package_format}")
+
+
+def staged_product_profile(staged_root: Path) -> dict[str, Any]:
+    """etc/product.json of a staged BuckyOS root (make_config --edition);
+    the full edition when the root has none."""
+    path = staged_root / "etc" / "product.json"
+    if not path.is_file():
+        return {"edition": "full", "capabilities": {"container": True}}
+    profile = json_load_file(path)
+    if profile.get("edition") not in ("full", "lite"):
+        raise ValueError(f"{path}: unknown product edition {profile.get('edition')!r}")
+    return profile
+
+
+def staged_product_edition(staged_root: Path) -> str:
+    return str(staged_product_profile(staged_root)["edition"])
 
 
 def manifest_install_project(manifest_path: Path, project_key: str) -> dict[str, Any]:

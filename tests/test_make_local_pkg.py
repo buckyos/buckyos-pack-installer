@@ -97,6 +97,21 @@ class MakeLocalPkgManifestTests(unittest.TestCase):
         self.assertEqual(dep_item["source_path"], str((root / "stage" / "buckyos" / "bin" / "cyfs-gateway").resolve()))
         self.assertEqual(buckyos["publish_deps"][0]["project_path"], str(cyfs_project.resolve()))
 
+    def test_staged_product_profile_is_packaged_as_a_module(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            project = root / "buckyos" / "src" / "bucky_project.json"
+            _write_project(project, app_key="buckyos", modules={"node_daemon": "bin/node-daemon/"})
+            without = make_local_pkg._build_project_manifest(project, build_root=root / "stage")
+            etc = root / "stage" / "buckyos" / "etc"
+            etc.mkdir(parents=True)
+            (etc / "product.json").write_text(json.dumps({"edition": "lite"}), encoding="utf-8")
+            staged = make_local_pkg._build_project_manifest(project, build_root=root / "stage")
+
+        paths = lambda manifest: {item["raw_path"] for item in manifest["install_projects"]["buckyos"]["module_items"]}
+        self.assertNotIn("etc/product.json", paths(without))
+        self.assertIn("etc/product.json", paths(staged))
+
     def test_dep_source_is_resolved_relative_to_project_config_dir(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)

@@ -71,6 +71,22 @@ publish:
             self.assertIn('cp -a "$DEFAULTS_DIR/data/." "$BUCKYOS_ROOT/data/"', postinst)
             self.assertIn("ExecStart=/opt/buckyos/bin/node-daemon/node_daemon --enable_active", postinst)
 
+    def test_a_product_without_containers_does_not_depend_on_docker(self) -> None:
+        full = debpkg._render_control_file(new_version="0.7.0", architecture="amd64")
+        lite = debpkg._render_control_file(new_version="0.7.0", architecture="amd64", runs_containers=False)
+        depends = lambda control: next(line for line in control.splitlines() if line.startswith("Depends:"))
+        self.assertIn("docker.io", depends(full))
+        self.assertEqual(depends(lite), "Depends: python3,curl,openssl,psmisc")
+
+        failures: list[str] = []
+        debpkg._verify_linux_dependencies(depends(lite), failures, package_kind="deb", runs_containers=False)
+        self.assertEqual(failures, [])
+        debpkg._verify_linux_dependencies(depends(lite), failures, package_kind="deb")
+        self.assertEqual(failures, ["deb dependency missing Docker provider alternative"])
+        failures.clear()
+        debpkg._verify_linux_dependencies(depends(full), failures, package_kind="deb", runs_containers=False)
+        self.assertEqual(failures, ["deb of a product without containers depends on Docker"])
+
     def test_linux_hooks_are_discovered_from_deb_pkg(self) -> None:
         hook = debpkg._discover_linux_hook("buckyos", "preinstall")
 

@@ -694,6 +694,10 @@ def generate_nsis_script(
         "COMPONENT_SECTIONS", "COMPONENT_DESCRIPTIONS", "UNINSTALL_SHORTCUTS",
         "UNINSTALL_COMPONENTS",
     )}
+    # The product edition of the service payload (etc/product.json):
+    # BuckyOS Desktop Lite runs no container, so its installer checks no Docker.
+    edition = "full"
+    needs_docker = False
     for idx, comp in enumerate(components):
         label = _sanitize_id(comp.key).replace("-", "_")
         var = f"$InstDir_{label}"
@@ -723,8 +727,13 @@ def generate_nsis_script(
             service_prerequisites = ""
             if comp.system_service:
                 vc_section = "VCREDIST_CHECK_BUNDLED" if has_vcredist else "VCREDIST_CHECK_MISSING"
+                product = common.staged_product_profile(comp_payload)
+                edition = str(product["edition"])
+                runs_containers = bool(product.get("capabilities", {}).get("container", False))
+                needs_docker = needs_docker or runs_containers
                 service_prerequisites = render(
                     "SERVICE_PREREQUISITES", LABEL=label,
+                    DOCKER_CHECK=render("DOCKER_CHECK", LABEL=label) if runs_containers else "",
                     VCREDIST_CHECK=render(vc_section, LABEL=label),
                 )
             stop_app = ""
@@ -767,7 +776,9 @@ def generate_nsis_script(
         TITLE=title, VERSION=version, ARCHITECTURE=architecture,
         OUTPUT_FILENAME=common.package_filename(
             platform_key="windows", architecture=architecture, version=version, package_format="exe",
+            edition=edition,
         ),
+        DOCKER_FUNCTIONS=render("DOCKER_FUNCTIONS") if needs_docker else "",
         ARCH_INCLUDE='!include "x64.nsh"\n' if is_x64 else "",
         DEFAULT_INSTALL_DIR=r"$PROGRAMFILES64\BuckyOS" if is_x64 else r"$PROGRAMFILES\BuckyOS",
         FINISH_PAGE_OPTIONS=render("FINISH_PAGE_OPTIONS", NAME=launch_bundle.name) if launch_bundle else "",
@@ -958,11 +969,15 @@ def build_win_installer(
         raise RuntimeError(f"NSIS compilation failed with code {rc}")
     
     # Move output to target directory
+    service_payload = next(
+        (payload_dir / comp.key for comp in components if comp.system_service), None
+    )
     out_name = common.package_filename(
         platform_key="windows",
         architecture=architecture,
         version=version,
         package_format="exe",
+        edition=common.staged_product_edition(service_payload) if service_payload else "full",
     )
     built_exe = work_dir / out_name
     out_exe = out_dir / out_name

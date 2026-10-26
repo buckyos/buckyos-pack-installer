@@ -272,11 +272,21 @@ def _normalize_deb_arch(arch: str) -> str:
     return common.canonical_arch(arch)
 
 
-def _render_control_file(*, new_version: str, architecture: str) -> str:
+def _render_control_file(*, new_version: str, architecture: str, runs_containers: bool = True) -> str:
     control_file = DEB_PKG_DIR / "control"
     content = control_file.read_text(encoding="utf-8")
     content = content.replace("{{package version here}}", new_version)
     content = content.replace("{{architecture}}", _normalize_deb_arch(architecture))
+    if not runs_containers:
+        # BuckyOS Desktop Lite runs no container: Docker is no dependency.
+        lines = []
+        for line in content.splitlines(keepends=True):
+            if line.startswith("Depends:"):
+                deps = [dep.strip() for dep in line[len("Depends:"):].split(",")]
+                deps = [dep for dep in deps if not any(_dependency_present(dep, name) for name in LINUX_DOCKER_DEPS)]
+                line = "Depends: " + ",".join(deps) + "\n"
+            lines.append(line)
+        content = "".join(lines)
     return content
 
 
@@ -421,6 +431,7 @@ def materialize_deb_control_dir(
     version: str,
     architecture: str,
     manifest_path: Path | None = None,
+    runs_containers: bool = True,
 ) -> None:
     """
     Render DEBIAN/control, preinst and postinst from deb_pkg sources.
@@ -434,7 +445,7 @@ def materialize_deb_control_dir(
 
     debian_dir.mkdir(parents=True, exist_ok=True)
     (debian_dir / "control").write_text(
-        _render_control_file(new_version=version, architecture=architecture),
+        _render_control_file(new_version=version, architecture=architecture, runs_containers=runs_containers),
         encoding="utf-8",
     )
     (debian_dir / "preinst").write_text(
@@ -490,18 +501,6 @@ def build_deb(
     if deb_dir.exists() and not dry_run:
         shutil.rmtree(deb_dir, ignore_errors=True)
 
-    if dry_run:
-        print(f"[dry-run] materialize deb control scripts: {DEB_PKG_DIR} -> {deb_dir / 'DEBIAN'}")
-    else:
-        deb_dir.mkdir(parents=True, exist_ok=True)
-        materialize_deb_control_dir(
-            project_yaml_path,
-            deb_dir / "DEBIAN",
-            version=version,
-            architecture=deb_arch,
-            manifest_path=manifest_path,
-        )
-
     payload_root = deb_dir / "opt" / "buckyos"
     layout = resolve_app_layout(
         app_key="buckyos",
@@ -515,6 +514,20 @@ def build_deb(
         layout=layout,
         allow_missing=dry_run,
     )
+    product = common.staged_product_profile(src_root)
+
+    if dry_run:
+        print(f"[dry-run] materialize deb control scripts: {DEB_PKG_DIR} -> {deb_dir / 'DEBIAN'}")
+    else:
+        deb_dir.mkdir(parents=True, exist_ok=True)
+        materialize_deb_control_dir(
+            project_yaml_path,
+            deb_dir / "DEBIAN",
+            version=version,
+            architecture=deb_arch,
+            manifest_path=manifest_path,
+            runs_containers=bool(product.get("capabilities", {}).get("container", False)),
+        )
 
     if dry_run:
         print(f"[dry-run] stage buckyos: {src_root} -> {payload_root}")
@@ -540,6 +553,7 @@ def build_deb(
         architecture=deb_arch,
         version=version,
         package_format="deb",
+        edition=str(product["edition"]),
     )
     build_cmd = [
         "dpkg-deb",
@@ -564,12 +578,17 @@ def _dependency_present(dep_text: str, dep_name: str) -> bool:
     return re.search(rf"(^|[,\s|()]){re.escape(dep_name)}([,\s|()<>:=]|$)", dep_text) is not None
 
 
-def _verify_linux_dependencies(dep_text: str, failures: List[str], *, package_kind: str) -> None:
+def _verify_linux_dependencies(
+    dep_text: str, failures: List[str], *, package_kind: str, runs_containers: bool = True
+) -> None:
     for dep_name in LINUX_REQUIRED_DEPS:
         if not _dependency_present(dep_text, dep_name):
             failures.append(f"{package_kind} dependency missing: {dep_name}")
-    if not any(_dependency_present(dep_text, dep_name) for dep_name in LINUX_DOCKER_DEPS):
+    docker = any(_dependency_present(dep_text, dep_name) for dep_name in LINUX_DOCKER_DEPS)
+    if runs_containers and not docker:
         failures.append(f"{package_kind} dependency missing Docker provider alternative")
+    if not runs_containers and docker:
+        failures.append(f"{package_kind} of a product without containers depends on Docker")
 
 
 def _linux_payload_allowlist(layout: AppLayout, *, include_systemd_service: bool) -> tuple[List[str], List[str]]:
@@ -734,6 +753,7 @@ def verify_pkg(
             control_dir = work / "control"
             extract_dir.mkdir(parents=True, exist_ok=True)
 
+            depends = None
             try:
                 package_name = _deb_control_field(pkg_path, "Package")
                 version = _deb_control_field(pkg_path, "Version")
@@ -745,7 +765,6 @@ def verify_pkg(
                     failures.append("deb Version is empty")
                 if architecture not in ("amd64", "arm64"):
                     failures.append(f"deb Architecture should be amd64|arm64, got {architecture!r}")
-                _verify_linux_dependencies(depends, failures, package_kind="deb")
             except subprocess.CalledProcessError as e:
                 failures.append(f"dpkg-deb control field read failed: {e}")
 
@@ -762,6 +781,14 @@ def verify_pkg(
                 )
                 component_keys = _linux_component_keys(project_yaml_path, manifest_path)
                 _verify_linux_component_keys(component_keys, failures, package_kind="deb")
+                if depends is not None:
+                    product = common.staged_product_profile(extract_dir / "opt" / "buckyos")
+                    _verify_linux_dependencies(
+                        depends,
+                        failures,
+                        package_kind="deb",
+                        runs_containers=bool(product.get("capabilities", {}).get("container", False)),
+                    )
                 payload_paths = [path.relative_to(extract_dir).as_posix() for path in extract_dir.rglob("*")]
                 _verify_linux_payload_contract(
                     payload_paths=payload_paths,

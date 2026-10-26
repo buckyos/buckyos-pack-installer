@@ -66,12 +66,30 @@ run_existing_stop_script() {
     return
   fi
 
-  stop_buckyos_containers
+  if [ "${PRODUCT_RUNS_CONTAINERS:-1}" = "1" ]; then
+    stop_buckyos_containers
+  fi
 }
 
-ensure_launchdaemon_docker
+SCRIPT_DIR="${0:A:h}"
+# The package's product profile (etc/product.json, packaged next to this
+# script): BuckyOS Desktop Lite runs no container and needs no Docker.
+if /usr/bin/grep -Eq '"container"[[:space:]]*:[[:space:]]*false' "$SCRIPT_DIR/product.json" 2>/dev/null; then
+  echo "[buckyos] preinstall: BuckyOS Desktop Lite, no container runtime needed"
+  PRODUCT_RUNS_CONTAINERS=0
+else
+  ensure_launchdaemon_docker
+  PRODUCT_RUNS_CONTAINERS=1
+fi
 
 echo "[buckyos] preinstall: stopping service (best effort)"
+# A Runtime installed for a desktop user stops through its own control path.
+OLD_RUNTIME="$BUCKYOS_ROOT/bin/node-daemon/BuckyOS Runtime.app/Contents/MacOS/node_daemon"
+if [ -x "$OLD_RUNTIME" ]; then
+  run_with_timeout 60 "$OLD_RUNTIME" service stop --root "$BUCKYOS_ROOT" >/dev/null 2>&1 || {
+    echo "[buckyos] preinstall: stopping the installed BuckyOS Runtime failed" >&2
+  }
+fi
 # Don't use kickstart here: it may start (or wait for) the job and block in installer context.
 launchctl disable "system/buckyos.service" >/dev/null 2>&1 || true
 run_with_timeout 10 launchctl bootout system "$DAEMON_PLIST" >/dev/null 2>&1 || true

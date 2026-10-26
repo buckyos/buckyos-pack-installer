@@ -34,7 +34,6 @@ SetCompressor lzma
 @@FINISH_PAGE_OPTIONS@@
 
 ; Variables for component install directories
-Var DockerCheckCode
 Var PortCheckCode
 Var PortCheckPort
 Var VCRedistInstalled
@@ -85,22 +84,7 @@ Function DirectoryPageLeave
 FunctionEnd
 
 ; Runtime dependency checks
-Function CheckDockerDesktopForUser
-  StrCpy $DockerCheckCode "0"
-  nsExec::Exec 'cmd /c "docker --version >nul 2>nul"'
-  Pop $0
-  ${If} $0 != 0
-    StrCpy $DockerCheckCode "1"
-    Return
-  ${EndIf}
-  nsExec::Exec 'cmd /c "docker version >nul 2>nul"'
-  Pop $0
-  ${If} $0 != 0
-    StrCpy $DockerCheckCode "2"
-    Return
-  ${EndIf}
-FunctionEnd
-
+@@DOCKER_FUNCTIONS@@
 Function CheckRequiredPorts
   StrCpy $PortCheckCode "0"
   StrCpy $PortCheckPort ""
@@ -379,7 +363,35 @@ interactive_hook_failed_@@LABEL@@:
   ${EndIf}
 ; @@template SERVICE_PREREQUISITES@@
 dep_check_@@LABEL@@:
-  ; Check Docker only for the selected service component
+@@DOCKER_CHECK@@
+  ; Check Visual C++ runtime only for the selected service component
+  Call IsVCRedistInstalled
+  ${If} $VCRedistInstalled != "1"
+@@VCREDIST_CHECK@@
+  ${EndIf}
+dep_check_@@LABEL@@_done:
+
+  ; Stop existing service and running processes before overwrite
+  Call ExtractBundledStopScript
+  Call StopExistingBuckyOS
+  ; Check required ports only when installation actually starts
+port_check_@@LABEL@@:
+  Call CheckRequiredPorts
+  ${If} $PortCheckCode != "0"
+    IfSilent silent_port_busy interactive_port_busy
+silent_port_busy:
+    FileOpen $0 "$InstallerLogPath" a
+    FileWrite $0 "Required port $PortCheckPort is busy.$\r$\n"
+    FileClose $0
+    SetErrorLevel 40
+    Abort
+interactive_port_busy:
+    MessageBox MB_RETRYCANCEL|MB_ICONSTOP "Required port $PortCheckPort cannot be bound.$\r$\nPlease free ports 3180, 80, and 443 before installing." IDRETRY port_check_@@LABEL@@
+    Abort
+  ${EndIf}
+; @@template DOCKER_CHECK@@
+  ; Check Docker only for the selected service component (not for BuckyOS
+  ; Desktop Lite, which runs no container)
   Call CheckDockerDesktopForUser
   ${If} $DockerCheckCode != "0"
     ${If} $DockerCheckCode == "1"
@@ -410,31 +422,23 @@ interactive_docker_engine:
     ${EndIf}
   ${EndIf}
 
-  ; Check Visual C++ runtime only for the selected service component
-  Call IsVCRedistInstalled
-  ${If} $VCRedistInstalled != "1"
-@@VCREDIST_CHECK@@
+; @@template DOCKER_FUNCTIONS@@
+Var DockerCheckCode
+Function CheckDockerDesktopForUser
+  StrCpy $DockerCheckCode "0"
+  nsExec::Exec 'cmd /c "docker --version >nul 2>nul"'
+  Pop $0
+  ${If} $0 != 0
+    StrCpy $DockerCheckCode "1"
+    Return
   ${EndIf}
-dep_check_@@LABEL@@_done:
-
-  ; Stop existing service and running processes before overwrite
-  Call ExtractBundledStopScript
-  Call StopExistingBuckyOS
-  ; Check required ports only when installation actually starts
-port_check_@@LABEL@@:
-  Call CheckRequiredPorts
-  ${If} $PortCheckCode != "0"
-    IfSilent silent_port_busy interactive_port_busy
-silent_port_busy:
-    FileOpen $0 "$InstallerLogPath" a
-    FileWrite $0 "Required port $PortCheckPort is busy.$\r$\n"
-    FileClose $0
-    SetErrorLevel 40
-    Abort
-interactive_port_busy:
-    MessageBox MB_RETRYCANCEL|MB_ICONSTOP "Required port $PortCheckPort cannot be bound.$\r$\nPlease free ports 3180, 80, and 443 before installing." IDRETRY port_check_@@LABEL@@
-    Abort
+  nsExec::Exec 'cmd /c "docker version >nul 2>nul"'
+  Pop $0
+  ${If} $0 != 0
+    StrCpy $DockerCheckCode "2"
+    Return
   ${EndIf}
+FunctionEnd
 ; @@template VCREDIST_CHECK_BUNDLED@@
     Call ExtractBundledVCRedist
     Call InstallBundledVCRedist

@@ -292,12 +292,17 @@ def _dependency_present(dep_text: str, dep_name: str) -> bool:
     return re.search(rf"(^|[,\s|()]){re.escape(dep_name)}([,\s|()<>:=]|$)", dep_text) is not None
 
 
-def _verify_linux_dependencies(dep_text: str, failures: List[str], *, package_kind: str) -> None:
+def _verify_linux_dependencies(
+    dep_text: str, failures: List[str], *, package_kind: str, runs_containers: bool = True
+) -> None:
     for dep_name in LINUX_REQUIRED_DEPS:
         if not _dependency_present(dep_text, dep_name):
             failures.append(f"{package_kind} dependency missing: {dep_name}")
-    if not any(_dependency_present(dep_text, dep_name) for dep_name in LINUX_DOCKER_DEPS):
+    docker = any(_dependency_present(dep_text, dep_name) for dep_name in LINUX_DOCKER_DEPS)
+    if runs_containers and not docker:
         failures.append(f"{package_kind} dependency missing Docker provider alternative")
+    if not runs_containers and docker:
+        failures.append(f"{package_kind} of a product without containers depends on Docker")
 
 
 def _linux_payload_allowlist(layout: AppLayout, *, include_systemd_service: bool) -> tuple[List[str], List[str]]:
@@ -557,6 +562,7 @@ def _render_spec(
     payload_tree: Path,
     layout: AppLayout,
     component_keys: List[str],
+    runs_containers: bool = True,
 ) -> str:
     pre_lines = [
         "set -e",
@@ -592,6 +598,8 @@ def _render_spec(
             "post_script": _scriptlet(post_lines),
             "preun_script": _scriptlet(preun_lines),
             "postun_script": _scriptlet(postun_lines),
+            # BuckyOS Desktop Lite runs no container: Docker is no dependency.
+            "docker_requires": "Requires: (moby-engine or docker-ce or docker-engine)" if runs_containers else "",
         },
     )
 
@@ -643,6 +651,7 @@ def build_rpm(
     )
     payload_root = payload_tree / "opt" / "buckyos"
     component_keys = _linux_component_keys(project_yaml_path, manifest_path)
+    product = common.staged_product_profile(src_root)
 
     if dry_run:
         print(f"[dry-run] rpm Version={rpm_version} Release={rpm_release} TargetArch={rpm_architecture}")
@@ -660,6 +669,7 @@ def build_rpm(
         payload_tree=payload_tree,
         layout=layout,
         component_keys=component_keys,
+        runs_containers=bool(product.get("capabilities", {}).get("container", False)),
     )
     build_cmd = [
         "rpmbuild",
@@ -679,6 +689,7 @@ def build_rpm(
         architecture=canonical_arch,
         version=version,
         package_format="rpm",
+        edition=str(product["edition"]),
     )
 
     if dry_run:
@@ -726,6 +737,23 @@ def _verify_rpm_paios_images(pkg_path: Path, arch: str, failures: List[str], *, 
             failures.append(f"rpm paios-images extraction failed: {cpio.stderr.strip()}")
             return
         common.verify_paios_images(extract_dir, arch or "amd64", failures, required=required)
+
+
+def _rpm_product_profile(pkg_path: Path, payload_paths: List[str]) -> dict:
+    """etc/product.json of the package payload (the full edition without one)."""
+    with tempfile.TemporaryDirectory(prefix="buckyos-rpm-product-") as td:
+        extract_dir = Path(td)
+        if "/opt/buckyos/etc/product.json" in payload_paths:
+            rpm2cpio = subprocess.Popen(["rpm2cpio", str(pkg_path)], stdout=subprocess.PIPE)
+            subprocess.run(
+                ["cpio", "-idm", "--quiet", "./opt/buckyos/etc/product.json"],
+                stdin=rpm2cpio.stdout,
+                cwd=extract_dir,
+                capture_output=True,
+            )
+            rpm2cpio.stdout.close()
+            rpm2cpio.wait()
+        return common.staged_product_profile(extract_dir / "opt" / "buckyos")
 
 
 def verify_pkg(
@@ -778,9 +806,9 @@ def verify_pkg(
         except subprocess.CalledProcessError as err:
             failures.append(err.stderr.strip() or "rpm metadata query failed")
 
+        requires_text = None
         try:
             requires_text = _rpm_query(pkg_path, ["-qp", "--requires"])
-            _verify_linux_dependencies(requires_text, failures, package_kind="rpm")
         except subprocess.CalledProcessError as err:
             failures.append(err.stderr.strip() or "rpm requires query failed")
 
@@ -795,6 +823,15 @@ def verify_pkg(
             )
         except subprocess.CalledProcessError as err:
             failures.append(err.stderr.strip() or "rpm payload listing failed")
+
+        if requires_text is not None:
+            product = _rpm_product_profile(pkg_path, payload_paths)
+            _verify_linux_dependencies(
+                requires_text,
+                failures,
+                package_kind="rpm",
+                runs_containers=bool(product.get("capabilities", {}).get("container", False)),
+            )
 
         if require_paios_images or any(path.endswith("/bin/paios-images/" + common.PAIOS_IMAGES_MANIFEST) for path in payload_paths):
             _verify_rpm_paios_images(pkg_path, arch, failures, required=require_paios_images)
