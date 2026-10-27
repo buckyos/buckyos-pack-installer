@@ -389,56 +389,39 @@ interactive_port_busy:
     MessageBox MB_RETRYCANCEL|MB_ICONSTOP "Required port $PortCheckPort cannot be bound.$\r$\nPlease free ports 3180, 80, and 443 before installing." IDRETRY port_check_@@LABEL@@
     Abort
   ${EndIf}
-; @@template DOCKER_CHECK@@
-  ; Check Docker only for the selected service component (not for BuckyOS
-  ; Desktop Lite, which runs no container)
-  Call CheckDockerDesktopForUser
-  ${If} $DockerCheckCode != "0"
-    ${If} $DockerCheckCode == "1"
-      IfSilent silent_docker_missing interactive_docker_missing
-silent_docker_missing:
-      FileOpen $0 "$InstallerLogPath" a
-      FileWrite $0 "Docker CLI is required but was not found.$\r$\n"
-      FileClose $0
-      SetErrorLevel 20
-      Abort
-interactive_docker_missing:
-      MessageBox MB_ABORTRETRYIGNORE|MB_ICONSTOP "Docker Desktop is required.$\r$\nThe installer could not find the docker command in the current PATH.$\r$\n$\r$\nAbort=Cancel, Retry=Retry, Ignore=Open install guide." IDRETRY dep_check_@@LABEL@@ IDIGNORE open_docker_@@LABEL@@
-      Abort
-open_docker_@@LABEL@@:
-      ExecShell "open" "https://docs.docker.com/desktop/setup/install/windows-install/"
-      Goto dep_check_@@LABEL@@
-    ${Else}
-      IfSilent silent_docker_engine interactive_docker_engine
-silent_docker_engine:
-      FileOpen $0 "$InstallerLogPath" a
-      FileWrite $0 "Docker Engine is not reachable.$\r$\n"
-      FileClose $0
-      SetErrorLevel 21
-      Abort
-interactive_docker_engine:
-      MessageBox MB_RETRYCANCEL|MB_ICONSTOP "Docker Desktop was found, but Docker Engine is not reachable right now.$\r$\nPlease open Docker Desktop, wait until it finishes starting, then retry." IDRETRY dep_check_@@LABEL@@
-      Abort
-    ${EndIf}
+; @@template DESKTOP_MODE_CHECK@@
+  InitPluginsDir
+  SetOutPath "$PLUGINSDIR\desktop-mode"
+  File /oname=install_mode.ps1 "@@SCRIPTS_PATH@@\install_mode.ps1"
+  File /oname=offline_mode.ps1 "@@SCRIPTS_PATH@@\offline_mode.ps1"
+  File /oname=full.json "@@PAYLOAD_PATH@@\etc\product-profiles\full.json"
+  File /oname=lite.json "@@PAYLOAD_PATH@@\etc\product-profiles\lite.json"
+  StrCpy $2 ""
+  StrCpy $3 ""
+  ${GetParameters} $0
+  ClearErrors
+  ${GetOptions} $0 "/LITE" $1
+  ${IfNot} ${Errors}
+    StrCpy $2 "-Lite"
   ${EndIf}
-
-; @@template DOCKER_FUNCTIONS@@
-Var DockerCheckCode
-Function CheckDockerDesktopForUser
-  StrCpy $DockerCheckCode "0"
-  nsExec::Exec 'cmd /c "docker --version >nul 2>nul"'
+  IfSilent 0 +2
+    StrCpy $3 "-Silent"
+  nsExec::ExecToLog 'powershell.exe -NoProfile -ExecutionPolicy Bypass -File "$PLUGINSDIR\desktop-mode\offline_mode.ps1" -Action Select -Root "@@INSTALL_VAR@@" -Profiles "$PLUGINSDIR\desktop-mode" -State "$PLUGINSDIR\desktop-mode\state.json" $2 $3'
   Pop $0
   ${If} $0 != 0
-    StrCpy $DockerCheckCode "1"
-    Return
+    SetErrorLevel 21
+    Abort
   ${EndIf}
-  nsExec::Exec 'cmd /c "docker version >nul 2>nul"'
+; @@template DESKTOP_MODE_APPLY@@
+  StrCpy $3 ""
+  IfSilent 0 +2
+    StrCpy $3 "-Silent"
+  nsExec::ExecToLog 'powershell.exe -NoProfile -ExecutionPolicy Bypass -File "@@INSTALL_VAR@@\scripts\offline_mode.ps1" -Action Apply -Root "@@INSTALL_VAR@@" -Profiles "@@INSTALL_VAR@@\etc\product-profiles" -State "$PLUGINSDIR\desktop-mode\state.json" $3'
   Pop $0
   ${If} $0 != 0
-    StrCpy $DockerCheckCode "2"
-    Return
+    SetErrorLevel 21
+    Abort
   ${EndIf}
-FunctionEnd
 ; @@template VCREDIST_CHECK_BUNDLED@@
     Call ExtractBundledVCRedist
     Call InstallBundledVCRedist

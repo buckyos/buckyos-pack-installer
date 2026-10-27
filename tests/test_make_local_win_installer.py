@@ -280,8 +280,10 @@ class WindowsPackagerTests(unittest.TestCase):
                     out_path=out_path,
                 )
                 script = out_path.read_text(encoding="utf-8-sig")
-                self.assertEqual("Call CheckDockerDesktopForUser" in script, expect_docker)
-                self.assertEqual("Function CheckDockerDesktopForUser" in script, expect_docker)
+                self.assertIn("offline_mode.ps1", script)
+                self.assertIn("-Action Select", script)
+                self.assertNotIn("Function CheckDockerDesktopForUser", script)
+                self.assertIn("-Action Apply", script)
                 self.assertIn(f'OutFile "{expect_name}"', script)
                 self.assertIn("Call IsVCRedistInstalled", script)
 

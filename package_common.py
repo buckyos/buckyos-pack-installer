@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import shutil
 from pathlib import Path
 from typing import Any, Iterable, Sequence
 
@@ -103,6 +104,23 @@ def staged_product_profile(staged_root: Path) -> dict[str, Any]:
 
 def staged_product_edition(staged_root: Path) -> str:
     return str(staged_product_profile(staged_root)["edition"])
+
+
+def stage_desktop_profiles(source: Path, destination: Path) -> None:
+    """Carry both release profiles through explicit-module staging."""
+    if staged_product_edition(source) != "full":
+        raise ValueError("unified offline installers require a Full stage with PAIOS images; choose Lite at installation time")
+    profiles = source / "etc" / "product-profiles"
+    if not profiles.is_dir():
+        raise FileNotFoundError(f"unified desktop payload has no profiles: {profiles}")
+    for edition in ("full", "lite"):
+        profile = json_load_file(profiles / f"{edition}.json")
+        if profile.get("schema_version") != 1 or profile.get("edition") != edition:
+            raise ValueError(f"invalid desktop profile: {edition}")
+    target = destination / "etc"
+    target.mkdir(parents=True, exist_ok=True)
+    shutil.copytree(profiles, target / "product-profiles", dirs_exist_ok=True)
+    shutil.copy2(source / "etc" / "product.json", target / "product.json")
 
 
 def manifest_install_project(manifest_path: Path, project_key: str) -> dict[str, Any]:

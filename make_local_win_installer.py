@@ -50,6 +50,8 @@ IGNORED_STAGE_NAMES = {".DS_Store", "__pycache__"}
 WINDOWS_HOOK_EXTENSIONS = (".ps1", ".bat", ".cmd")
 WINDOWS_HOOK_STEPS = ("preinstall", "postinstall", "preuninstall")
 WINDOWS_SERVICE_SCRIPT_NAMES = (
+    "install_mode.ps1",
+    "offline_mode.ps1",
     "seed_defaults.ps1",
     "ensure_firewall_rules.ps1",
     "uninstall_cleanup.ps1",
@@ -698,7 +700,6 @@ def generate_nsis_script(
     # The product edition of the service payload (etc/product.json):
     # BuckyOS Desktop Lite runs no container, so its installer checks no Docker.
     edition = "full"
-    needs_docker = False
     for idx, comp in enumerate(components):
         label = _sanitize_id(comp.key).replace("-", "_")
         var = f"$InstDir_{label}"
@@ -730,11 +731,12 @@ def generate_nsis_script(
                 vc_section = "VCREDIST_CHECK_BUNDLED" if has_vcredist else "VCREDIST_CHECK_MISSING"
                 product = common.staged_product_profile(comp_payload)
                 edition = str(product["edition"])
-                runs_containers = bool(product.get("capabilities", {}).get("container", False))
-                needs_docker = needs_docker or runs_containers
+                # The incoming payload is unified. Installed edition and the
+                # explicit /LITE option are resolved at install time.
                 service_prerequisites = render(
                     "SERVICE_PREREQUISITES", LABEL=label,
-                    DOCKER_CHECK=render("DOCKER_CHECK", LABEL=label) if runs_containers else "",
+                    DOCKER_CHECK=render("DESKTOP_MODE_CHECK", LABEL=label, INSTALL_VAR=var,
+                                        PAYLOAD_PATH=str(comp_payload), SCRIPTS_PATH=str(WIN_PKG_PROJECT_DIR / "scripts")),
                     VCREDIST_CHECK=render(vc_section, LABEL=label),
                 )
             stop_app = ""
@@ -758,7 +760,7 @@ def generate_nsis_script(
             SECTION_FLAG=" /o" if comp.optional and not comp.default_selected else "",
             REQUIRED_SECTION="  SectionIn RO\n" if not comp.optional else "",
             PAYLOAD_INSTALL=payload_install, BUNDLE_INSTALL=bundle_install,
-            SERVICE_INSTALL=render("SERVICE_INSTALL", **context) if comp.system_service else "",
+            SERVICE_INSTALL=(render("DESKTOP_MODE_APPLY", **context) + render("SERVICE_INSTALL", **context)) if comp.system_service else "",
             POST_HOOK=_render_windows_hook(templates, comp, comp_payload, var, "postinstall"),
         ))
         desc = f"Install {comp.name}" + (" (Optional)" if comp.optional else "")
@@ -779,7 +781,7 @@ def generate_nsis_script(
             platform_key="windows", architecture=architecture, version=version, package_format="exe",
             edition=edition,
         ),
-        DOCKER_FUNCTIONS=render("DOCKER_FUNCTIONS") if needs_docker else "",
+        DOCKER_FUNCTIONS="",
         ARCH_INCLUDE='!include "x64.nsh"\n' if is_x64 else "",
         DEFAULT_INSTALL_DIR=r"$PROGRAMFILES64\BuckyOS" if is_x64 else r"$PROGRAMFILES\BuckyOS",
         FINISH_PAGE_OPTIONS=render("FINISH_PAGE_OPTIONS", NAME=launch_bundle.name) if launch_bundle else "",
@@ -893,6 +895,8 @@ def build_win_installer(
                 target_override=comp.default_target,
             )
             _stage_buckyos_app_root(src_root=src, dst_root=comp_payload, layout=layout)
+            if comp.system_service:
+                common.stage_desktop_profiles(src, comp_payload)
             
             if comp.system_service:
                 scripts_src = WIN_PKG_PROJECT_DIR / "scripts"

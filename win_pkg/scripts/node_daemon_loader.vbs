@@ -27,6 +27,15 @@ If Not fso.FileExists(nodeDaemonPath) Then
   WScript.Quit 1
 End If
 
+Dim backendPath, backendStream, backend
+backendPath = fso.BuildPath(rootDir, "etc\container-runtime")
+If fso.FileExists(backendPath) Then
+  Set backendStream = fso.OpenTextFile(backendPath, 1)
+  backend = Trim(backendStream.ReadAll)
+  backendStream.Close
+  If backend = "docker" Or backend = "wslc" Then shell.Environment("PROCESS")("BUCKYOS_CONTAINER_RUNTIME") = backend
+End If
+
 command = Quote(nodeDaemonPath) & " --enable_active"
 
 On Error Resume Next

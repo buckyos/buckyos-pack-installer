@@ -42,7 +42,7 @@ start_buckyos_runtime() {
     return 2
   fi
   echo "[buckyos] postinstall: binding ${REAL_BUCKYOS_ROOT} to ${user} and starting BuckyOS Runtime"
-  run_with_timeout 60 "$RUNTIME_BIN" service register --root "$REAL_BUCKYOS_ROOT" --user "$user"
+  run_with_timeout 60 "$RUNTIME_BIN" service register --root "$REAL_BUCKYOS_ROOT" --user "$user" || return 1
   run_with_timeout 60 "$RUNTIME_BIN" service start --root "$REAL_BUCKYOS_ROOT"
 }
 
@@ -57,6 +57,16 @@ wait_for_node_daemon() {
   done
   return 1
 }
+
+# Offline pkg preinstall records the selected mode before pkg copies files.
+SCRIPT_DIR="${0:A:h}"
+if [[ -f "$SCRIPT_DIR/selected-mode" ]]; then
+  SELECTED_EDITION="$(cat "$SCRIPT_DIR/selected-mode")"
+  case "$SELECTED_EDITION" in full|lite) ;; *) exit 1 ;; esac
+  mkdir -p "$BUCKYOS_ROOT/etc"
+  cp -p "$SCRIPT_DIR/profiles/$SELECTED_EDITION.json" "$BUCKYOS_ROOT/etc/product.json"
+  if [[ "$SELECTED_EDITION" == lite ]]; then rm -rf "$BUCKYOS_ROOT/bin/paios-images"; fi
+fi
 
 # The root LaunchDaemon of older installs never comes back.
 run_with_timeout 10 launchctl bootout system "$LEGACY_PLIST" >/dev/null 2>&1 || true

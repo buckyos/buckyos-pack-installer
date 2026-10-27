@@ -536,6 +536,8 @@ def build_macos_distribution_pkg(
                     target_override=str(target),
                 )
                 _stage_buckyos_app_root(src_root=src, dst_root=dst, layout=layout)
+                if comp.key == "buckyos":
+                    common.stage_desktop_profiles(src, dst)
             else:
                 if src.is_dir():
                     if str(target).endswith(".app"):
@@ -577,6 +579,9 @@ def build_macos_distribution_pkg(
                 shutil.rmtree(scripts_dir, ignore_errors=True)
             if not dry_run:
                 _materialize_pkg_scripts_from_templates(comp.key, templates_dir, scripts_dir)
+                if comp.key == "buckyos":
+                    shutil.copy2(templates_dir / "desktop_mode.zsh", scripts_dir / "desktop_mode.zsh")
+                    shutil.copytree(src / "etc" / "product-profiles", scripts_dir / "profiles", dirs_exist_ok=True)
                 # The scripts read the package's product edition (preinstall:
                 # BuckyOS Desktop Lite needs no Docker).
                 product = src / "etc" / "product.json"
@@ -952,15 +957,19 @@ def verify_pkg(
                 failures.append("buckyos missing preinstall script")
             else:
                 required_preinstall_snippets = [
-                    'checking Docker availability for LaunchDaemon/root',
-                    'command -v docker',
-                    'docker info',
-                    'OrbStack',
-                    'https://orbstack.dev/download',
+                    'desktop_mode.zsh',
+                    'desktop_select_mode',
+                    'SELECTED_EDITION',
                 ]
                 for snippet in required_preinstall_snippets:
                     if snippet not in preinstall_text:
-                        failures.append(f"buckyos preinstall missing Docker/OrbStack check: {snippet}")
+                        failures.append(f"buckyos preinstall missing desktop mode selection: {snippet}")
+                helper = _pkg_script_text(buckyos_pkg_dir, "desktop_mode.zsh")
+                if helper is None or 'desktop_as_user docker info' not in helper:
+                    failures.append("buckyos missing desktop-user Docker info check")
+                for edition in ("full", "lite"):
+                    if _pkg_script_text(buckyos_pkg_dir, f"profiles/{edition}.json") is None:
+                        failures.append(f"buckyos missing {edition} profile in installer scripts")
 
             # BuckyOS Desktop Lite: the scripts know the edition (no Docker
             # check) and the payload carries no container images.
