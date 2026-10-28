@@ -42,7 +42,10 @@ function Invoke-DesktopCommand {
         if (-not $p.Start()) { throw "Cannot start $File" }
         $stdout = $p.StandardOutput.ReadToEndAsync()
         $stderr = $p.StandardError.ReadToEndAsync()
-        if (-not $p.WaitForExit($Timeout * 1000)) { $p.Kill(); $p.WaitForExit(); return @{ Code = -1; Output = ''; Error = 'Command timed out.' } }
+        if (-not $p.WaitForExit($Timeout * 1000)) {
+            $p.Kill(); $p.WaitForExit()
+            return @{ Code = -1; Output = $stdout.GetAwaiter().GetResult(); Error = "Command timed out after $Timeout seconds.`n" + $stderr.GetAwaiter().GetResult() }
+        }
         $p.WaitForExit()
         return @{ Code = $p.ExitCode; Output = $stdout.GetAwaiter().GetResult(); Error = $stderr.GetAwaiter().GetResult() }
     } finally { $p.Dispose() }
@@ -59,23 +62,42 @@ function Find-DesktopProgram {
     return $null
 }
 
+function Write-DesktopProbeFailure {
+    param([string]$File, [string[]]$Arguments, $Result, [string]$Reason)
+    Write-Host ('Container probe failed: "{0}" {1} (exit {2}). {3}' -f $File, ($Arguments -join ' '), $Result.Code, $Reason) -ForegroundColor Yellow
+    foreach ($text in @($Result.Output, $Result.Error)) {
+        if (-not [string]::IsNullOrWhiteSpace($text)) { Write-Host ([string]$text).Trim() -ForegroundColor Yellow }
+    }
+}
+
 function Get-DesktopContainerBackend {
-    param([string]$Preferred = '')
+    param([string]$Preferred = '', [switch]$Diagnostics)
     $order = if ($Preferred -eq 'docker') { @('docker', 'wslc') } else { @('wslc', 'docker') }
     foreach ($backend in $order) {
         $file = Find-DesktopProgram ($backend + '.exe')
-        if (-not $file) { continue }
-        if ($backend -eq 'wslc') {
-            $r = Invoke-DesktopCommand $file @('system', 'info')
-            # Information alone need not start a VM. Local image enumeration
-            # contacts the engine without pulling an image or requiring stdin.
-            if ($r.Code -eq 0 -and $r.Output -match '(?im)^\s*Server:') {
+        if (-not $file) {
+            if ($Diagnostics) { Write-Host "Container runtime executable not found: $backend.exe" -ForegroundColor Yellow }
+            continue
+        }
+        try {
+            if ($backend -eq 'wslc') {
+                $r = Invoke-DesktopCommand $file @('system', 'info')
+                if ($r.Code -ne 0) {
+                    if ($Diagnostics) { Write-DesktopProbeFailure $file @('system', 'info') $r 'WSLC environment check failed.' }
+                    continue
+                }
+                # Local image enumeration contacts the engine without pulling
+                # images. Do not depend on English labels in system info output.
                 $session = Invoke-DesktopCommand $file @('image', 'ls')
                 if ($session.Code -eq 0) { return 'wslc' }
+                if ($Diagnostics) { Write-DesktopProbeFailure $file @('image', 'ls') $session 'WSLC engine is unavailable.' }
+            } else {
+                $r = Invoke-DesktopCommand $file @('info', '--format', '{{.OSType}}')
+                if ($r.Code -eq 0 -and $r.Output.Trim() -ceq 'linux') { return 'docker' }
+                if ($Diagnostics) { Write-DesktopProbeFailure $file @('info', '--format', '{{.OSType}}') $r 'A working Linux engine is required.' }
             }
-        } else {
-            $r = Invoke-DesktopCommand $file @('info', '--format', '{{.OSType}}')
-            if ($r.Code -eq 0 -and $r.Output.Trim() -ceq 'linux') { return 'docker' }
+        } catch {
+            if ($Diagnostics) { Write-Host "Container probe could not run ($file): $($_.Exception.Message)" -ForegroundColor Yellow }
         }
     }
     return ''
@@ -131,7 +153,7 @@ function Select-DesktopMode {
     $preferred = ''
     $backendFile = Join-Path $Root 'etc/container-runtime'
     if (Test-Path -LiteralPath $backendFile) { $preferred = (Get-Content -LiteralPath $backendFile -Raw).Trim() }
-    $backend = Get-DesktopContainerBackend $preferred
+    $backend = Get-DesktopContainerBackend $preferred -Diagnostics
     if ($backend) { return @{ Edition = 'full'; Backend = $backend } }
     if ($Silent) { $script:InstallerExitCode = 21; throw 'Full requires a usable WSLC or Docker Linux engine. Silent installation does not prepare dependencies or fall back to Lite.' }
     if (-not $Offline -and -not $Resumed) {
@@ -140,7 +162,7 @@ function Select-DesktopMode {
             try {
                 Write-Host 'Preparing WSL/WSLC. This may take several minutes.'
                 if ((Install-DesktopWsl $prep) -eq 'reboot') { return @{ Edition = 'full'; Backend = ''; Reboot = $true } }
-                $backend = Get-DesktopContainerBackend
+                $backend = Get-DesktopContainerBackend -Diagnostics
                 if ($backend) { return @{ Edition = 'full'; Backend = $backend } }
             } catch { Write-Host $_.Exception.Message -ForegroundColor Yellow }
         }
