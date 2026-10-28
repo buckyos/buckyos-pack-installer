@@ -21,7 +21,8 @@ function Get-DesktopInstalledEdition {
     catch [Management.Automation.ItemNotFoundException] { $item = $null }
     if ($item) { return (Read-DesktopProfile $file).edition }
     if ((Test-Path -LiteralPath (Join-Path $Root 'bin/node-daemon/node_daemon.exe')) -or
-        (Test-Path -LiteralPath (Join-Path $Root 'etc/node_identity.json')) -or
+        ((Test-Path -LiteralPath (Join-Path $Root 'etc/node_identity.json')) -and
+        -not (Test-Path -LiteralPath (Join-Path $Root '.online-uninstalled.json'))) -or
         (Test-Path -LiteralPath (Join-Path $Root '.online-installed-version'))) { return 'full' }
     return ''
 }

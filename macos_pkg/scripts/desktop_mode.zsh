@@ -57,7 +57,7 @@ desktop_select_mode() {
   if [[ -L "$root/etc/product.json" ]]; then print -u2 'Installed profile must not be a link.'; return 1; fi
   if [[ -f "$root/etc/product.json" ]]; then
     old="$(desktop_profile_edition "$root/etc/product.json")" || return 1
-  elif [[ -e "$root/bin/node-daemon" || -f "$root/etc/node_identity.json" || -f "$root/.online-installed-version" ]]; then old=full
+  elif [[ -e "$root/bin/node-daemon" || ( -f "$root/etc/node_identity.json" && ! -f "$root/.online-uninstalled.json" ) || -f "$root/.online-installed-version" ]]; then old=full
   fi
   if [[ "$old" == full && "$lite" == 1 ]]; then print -u2 '--lite conflicts with existing Full; mode conversion is not supported.'; return 1; fi
   if [[ "$old" == lite || "$lite" == 1 ]]; then print lite; return; fi
