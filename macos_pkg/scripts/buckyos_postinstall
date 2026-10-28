@@ -177,6 +177,29 @@ if [ -d "$DEFAULTS_DIR" ]; then
   rm -rf "$DEFAULTS_DIR" || true
 fi
 
+START_CONFIG_SOURCE="$BUCKYOS_ROOT/etc/start_config.json"
+START_CONFIG_SECURITY_ROOT="${BUCKYOS_SECURITY_ROOT:-$BUCKYOS_ROOT/security}"
+START_CONFIG_TARGET="$START_CONFIG_SECURITY_ROOT/start_config.json"
+if [ -e "$START_CONFIG_SOURCE" ] || [ -L "$START_CONFIG_SOURCE" ]; then
+  if [ ! -f "$START_CONFIG_SOURCE" ] || [ -L "$START_CONFIG_SOURCE" ] || [ -L "$START_CONFIG_SECURITY_ROOT" ] || [ -L "$START_CONFIG_TARGET" ]; then
+    echo "Cannot move startup config: expected regular files and a non-linked security directory" >&2
+    exit 1
+  fi
+  mkdir -p "$START_CONFIG_SECURITY_ROOT"
+  if [ -e "$START_CONFIG_TARGET" ]; then
+    if [ ! -f "$START_CONFIG_TARGET" ] || ! cmp -s "$START_CONFIG_SOURCE" "$START_CONFIG_TARGET"; then
+      echo "Startup config conflict: $START_CONFIG_SOURCE and $START_CONFIG_TARGET differ; resolve them before reinstalling" >&2
+      exit 1
+    fi
+    chmod 600 "$START_CONFIG_TARGET"
+    rm "$START_CONFIG_SOURCE"
+  else
+    chmod 600 "$START_CONFIG_SOURCE"
+    mv "$START_CONFIG_SOURCE" "$START_CONFIG_TARGET"
+  fi
+  echo "Startup config moved to $START_CONFIG_TARGET"
+fi
+
 set +e
 start_buckyos_runtime
 started=$?

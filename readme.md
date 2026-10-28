@@ -129,3 +129,12 @@ uv run ./make_local_pkg.py show-target
 - `sync-scripts` 会在 macOS / Windows 上同步安装脚本模板
 - `show-manifest` 会输出按安装项目分组的通用 JSON 清单，其中 `module_items` / `data_items` / `clean_items` 都带 `target_dir_name`
 - manifest 里的 `source_rootfs` / `source_path` 语义是 staging 后的 `BUCKYOS_BUILD_ROOT` 路径；原工程来源只保留在 `project_source_*` 元数据里
+
+## Retained startup configuration
+
+DEB/RPM/PKG/EXE postinstall hooks move retained `etc/start_config.json` into
+`security/start_config.json` (or `BUCKYOS_SECURITY_ROOT`) before runtime startup.
+Unix moves restrict the file to `0600`. Identical duplicates are removed;
+different copies or linked config/security paths fail without overwriting either
+config. This restores bootstrap after an identity-preserving data cleanup.
+Existing installer artifacts require rebuilding to include this hook change.
