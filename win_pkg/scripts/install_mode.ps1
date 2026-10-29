@@ -59,6 +59,22 @@ function Find-DesktopProgram {
         $file = Join-Path $env:ProgramFiles 'WSL/wslc.exe'
         if (Test-Path -LiteralPath $file -PathType Leaf) { return $file }
     }
+    if ($Name -in 'docker.exe', 'Docker Desktop.exe') {
+        $candidates = @()
+        if ($Name -eq 'Docker Desktop.exe') {
+            $docker = Find-DesktopProgram 'docker.exe'
+            if ($docker) {
+                # Also support Docker Desktop installed to a custom directory.
+                $candidates += [IO.Path]::GetFullPath((Join-Path ([IO.Path]::GetDirectoryName($docker)) '../../Docker Desktop.exe'))
+            }
+        }
+        $relative = if ($Name -eq 'docker.exe') { 'resources/bin/docker.exe' } else { $Name }
+        if ($env:ProgramFiles) { $candidates += Join-Path $env:ProgramFiles "Docker/Docker/$relative" }
+        if ($env:LOCALAPPDATA) { $candidates += Join-Path $env:LOCALAPPDATA "Programs/DockerDesktop/$relative" }
+        foreach ($file in $candidates) {
+            if (Test-Path -LiteralPath $file -PathType Leaf) { return $file }
+        }
+    }
     return $null
 }
 
@@ -99,6 +115,35 @@ function Get-DesktopContainerBackend {
         } catch {
             if ($Diagnostics) { Write-Host "Container probe could not run ($file): $($_.Exception.Message)" -ForegroundColor Yellow }
         }
+    }
+    return ''
+}
+
+function Start-DesktopDocker {
+    param([int]$Timeout = 120)
+    $docker = Find-DesktopProgram 'docker.exe'
+    $desktop = Find-DesktopProgram 'Docker Desktop.exe'
+    if (-not $docker -or -not $desktop) { return '' }
+    try {
+        Write-Host "Starting Docker Desktop and waiting for its Linux engine (up to $Timeout seconds)."
+        if (-not (Get-Process -Name 'Docker Desktop' -ErrorAction SilentlyContinue)) {
+            Start-Process -FilePath $desktop -ErrorAction Stop | Out-Null
+        }
+        $timer = [Diagnostics.Stopwatch]::StartNew()
+        do {
+            $remaining = [Math]::Max(1, [int][Math]::Ceiling($Timeout - $timer.Elapsed.TotalSeconds))
+            $r = Invoke-DesktopCommand $docker @('info', '--format', '{{.OSType}}') ([Math]::Min(5, $remaining))
+            if ($r.Code -eq 0) {
+                if ($r.Output.Trim() -ceq 'linux') { return 'docker' }
+                Write-Host 'Docker Desktop is using Windows containers. Select Linux containers in Docker Desktop to use Full.' -ForegroundColor Yellow
+                return ''
+            }
+            if ($timer.Elapsed.TotalSeconds -ge $Timeout) { break }
+            Start-Sleep -Milliseconds ([int][Math]::Min(2000, [Math]::Max(1, ($Timeout - $timer.Elapsed.TotalSeconds) * 1000)))
+        } while ($timer.Elapsed.TotalSeconds -lt $Timeout)
+        Write-DesktopProbeFailure $docker @('info', '--format', '{{.OSType}}') $r 'Docker Desktop did not become ready before the startup deadline.'
+    } catch {
+        Write-Host "Docker Desktop could not start: $($_.Exception.Message)" -ForegroundColor Yellow
     }
     return ''
 }
@@ -155,9 +200,21 @@ function Select-DesktopMode {
     if (Test-Path -LiteralPath $backendFile) { $preferred = (Get-Content -LiteralPath $backendFile -Raw).Trim() }
     $backend = Get-DesktopContainerBackend $preferred -Diagnostics
     if ($backend) { return @{ Edition = 'full'; Backend = $backend } }
-    if ($Silent) { $script:InstallerExitCode = 21; throw 'Full requires a usable WSLC or Docker Linux engine. Silent installation does not prepare dependencies or fall back to Lite.' }
+    $fullUnavailable = 'Full container dependencies are unavailable. Existing Full installation is preserved. Start Docker Desktop or enable WSLC, then run this installer again.'
+    if ($Silent) {
+        $script:InstallerExitCode = 21
+        if ($old -eq 'full') { throw [OperationCanceledException]::new($fullUnavailable) }
+        throw 'Full requires a usable WSLC or Docker Linux engine. Silent installation does not prepare dependencies or fall back to Lite.'
+    }
+    $backend = Start-DesktopDocker
+    if ($backend) { return @{ Edition = 'full'; Backend = $backend } }
     if (-not $Offline -and -not $Resumed) {
         try { $prep = Get-DesktopWslPreparation } catch { Write-Host $_.Exception.Message -ForegroundColor Yellow; $prep = $null }
+        if ($prep) {
+            Write-Host 'WSLC can run Full containers without Docker Desktop. Updating WSL enables WSLC.'
+            if ($old -eq 'full') { Write-Host 'Choose N to stop installation and preserve the existing Full installation.' }
+            else { Write-Host 'Choose N to continue to the Lite option.' }
+        }
         if ($prep -and (Read-Host 'Automatically install/update WSL for WSLC? [y/N]') -match '^(?i:y|yes)$') {
             try {
                 Write-Host 'Preparing WSL/WSLC. This may take several minutes.'
@@ -168,7 +225,10 @@ function Select-DesktopMode {
         }
     }
     Write-Host 'You can exit, install and start Docker Desktop yourself, then run this installer again.' -ForegroundColor Yellow
-    if ($old -eq 'full') { throw 'Full container dependencies are unavailable. Existing Full installation is preserved.' }
+    if ($old -eq 'full') {
+        $script:InstallerExitCode = 21
+        throw [OperationCanceledException]::new($fullUnavailable)
+    }
     Write-Host 'Lite disables containers and user service apps, supports static web and bundled script apps, and runs at most one Agent.'
     if ((Read-Host 'Install Lite? [y/N]') -notmatch '^(?i:y|yes)$') { throw 'Installation cancelled.' }
     return @{ Edition = 'lite'; Backend = '' }

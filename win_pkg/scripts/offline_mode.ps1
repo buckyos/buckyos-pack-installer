@@ -26,6 +26,13 @@ try {
         }
     }
     exit 0
+} catch [OperationCanceledException] {
+    Write-Host $_.Exception.Message
+    if (-not $Silent) {
+        Add-Type -AssemblyName System.Windows.Forms
+        [Windows.Forms.MessageBox]::Show($_.Exception.Message, 'BuckyOS installation stopped', 'OK', 'Information') | Out-Null
+    }
+    exit 21
 } catch {
     Write-Host $_.Exception.Message
     if (-not $Silent) {
