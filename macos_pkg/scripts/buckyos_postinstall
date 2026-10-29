@@ -4,8 +4,12 @@ export PATH="/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:${PA
 BUCKYOS_ROOT="${BUCKYOS_ROOT:-/opt/buckyos}"
 DEFAULTS_DIR="$BUCKYOS_ROOT/.buckyos_installer_defaults"
 REAL_BUCKYOS_ROOT="$(cd "$BUCKYOS_ROOT" 2>/dev/null && pwd -P || printf '%s\n' "$BUCKYOS_ROOT")"
-# Run node_daemon as a system LaunchDaemon (root) so it can bind privileged ports (80/443).
-PLIST="/Library/LaunchDaemons/buckyos.service.plist"
+# The Runtime bundle's main executable is node_daemon; it runs as the bound
+# user's LaunchAgent (com.buckyos.runtime) in that user's GUI session.
+RUNTIME_BUNDLE="${REAL_BUCKYOS_ROOT}/bin/node-daemon/BuckyOS Runtime.app"
+RUNTIME_EXE="${RUNTIME_BUNDLE}/Contents/MacOS/node_daemon"
+RUNTIME_LABEL="com.buckyos.runtime"
+BINDING_FILE="${REAL_BUCKYOS_ROOT}/etc/desktop_runtime.json"
 POSTINSTALL_LOG="/private/tmp/buckyos-postinstall.log"
 
 mkdir -p "$(dirname "$POSTINSTALL_LOG")"
@@ -18,30 +22,27 @@ run_with_timeout() {
   /usr/bin/perl -e '$t=shift; alarm $t; exec @ARGV' "$seconds" "$@"
 }
 
-start_buckyos_service() {
-  echo "[buckyos] postinstall: starting LaunchDaemon"
-  if [ ! -x "${REAL_BUCKYOS_ROOT}/bin/node-daemon/node_daemon" ]; then
-    echo "[buckyos] postinstall: missing or non-executable node_daemon at ${REAL_BUCKYOS_ROOT}/bin/node-daemon/node_daemon" >&2
-    return 1
-  fi
-  /usr/bin/plutil -lint "$PLIST"
-  run_with_timeout 10 launchctl enable "system/buckyos.service" >/dev/null 2>&1 || true
-  run_with_timeout 10 launchctl bootout system "$PLIST" >/dev/null 2>&1 || true
-  if ! run_with_timeout 10 launchctl bootstrap system "$PLIST"; then
-    echo "[buckyos] postinstall: launchctl bootstrap failed for $PLIST" >&2
-    launchctl print system/buckyos.service >&2 || true
-    return 1
-  fi
-  if ! run_with_timeout 10 launchctl kickstart -k "system/buckyos.service"; then
-    echo "[buckyos] postinstall: launchctl kickstart failed, continuing to wait for RunAtLoad." >&2
-    launchctl print system/buckyos.service >&2 || true
-  fi
+console_user() {
+  local user
+  user="$(/usr/bin/stat -f%Su /dev/console 2>/dev/null || true)"
+  case "$user" in
+    ""|root|loginwindow|_mbsetupuser) return 0 ;;
+  esac
+  printf '%s\n' "$user"
 }
 
-wait_for_node_daemon() {
+refresh_runtime_registration() {
+  local uid="$1"
+  local lsregister="/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister"
+  [ -x "$lsregister" ] || return 0
+  /bin/launchctl asuser "$uid" "$lsregister" -f "$RUNTIME_BUNDLE" >/dev/null 2>&1 || true
+}
+
+wait_for_runtime() {
+  local uid="$1"
   local attempt=1
   while [ "$attempt" -le 15 ]; do
-    if /usr/bin/pgrep -f "${BUCKYOS_ROOT}/bin/node-daemon/node_daemon --enable_active" >/dev/null 2>&1; then
+    if launchctl print "gui/$uid/$RUNTIME_LABEL" 2>/dev/null | /usr/bin/grep -q "pid = "; then
       return 0
     fi
     sleep 1
@@ -50,50 +51,6 @@ wait_for_node_daemon() {
   return 1
 }
 
-mkdir -p "/Library/LaunchDaemons"
-mkdir -p "${REAL_BUCKYOS_ROOT}/logs/node_daemon" || true
-chown -R root:wheel "${REAL_BUCKYOS_ROOT}/logs" >/dev/null 2>&1 || true
-cat > "$PLIST" << EOF
-<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-    <key>Label</key>
-    <string>buckyos.service</string>
-    <key>ProgramArguments</key>
-    <array>
-        <string>${REAL_BUCKYOS_ROOT}/bin/node-daemon/node_daemon</string>
-        <string>--enable_active</string>
-    </array>
-    <key>WorkingDirectory</key>
-    <string>${REAL_BUCKYOS_ROOT}</string>
-    <key>EnvironmentVariables</key>
-    <dict>
-        <key>BUCKYOS_ROOT</key>
-        <string>${REAL_BUCKYOS_ROOT}</string>
-        <key>HOME</key>
-        <string>/var/root</string>
-        <key>PATH</key>
-        <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
-        <key>RUST_BACKTRACE</key>
-        <string>1</string>
-    </dict>
-    <key>StandardOutPath</key>
-    <string>/var/log/buckyos.service.out.log</string>
-    <key>StandardErrorPath</key>
-    <string>/var/log/buckyos.service.err.log</string>
-    <key>RunAtLoad</key>
-    <true/>
-    <key>KeepAlive</key>
-    <true/>
-    <key>AbandonProcessGroup</key>
-    <true/>
-</dict>
-</plist>
-EOF
-# /Library/LaunchDaemons plists should not be writable by non-root users.
-chown root:wheel "$PLIST" || true
-chmod 644 "$PLIST"
 echo "[buckyos] postinstall: install data_paths if missing (overwrite install semantics)"
 
 if [ -d "$DEFAULTS_DIR" ]; then
@@ -200,18 +157,43 @@ if [ -d "$DEFAULTS_DIR" ]; then
   rm -rf "$DEFAULTS_DIR" || true
 fi
 
-start_buckyos_service
-if ! wait_for_node_daemon; then
-  echo "[buckyos] postinstall: node_daemon did not start successfully." >&2
-  /usr/bin/env >&2 || true
-  ls -l "$PLIST" "${REAL_BUCKYOS_ROOT}/bin/node-daemon/node_daemon" "${REAL_BUCKYOS_ROOT}/logs" "${REAL_BUCKYOS_ROOT}/logs/node_daemon" >&2 || true
-  tail -n 200 "$POSTINSTALL_LOG" >&2 || true
-  echo "[buckyos] postinstall: check /var/log/buckyos.service.out.log and /var/log/buckyos.service.err.log" >&2
-  tail -n 200 /var/log/buckyos.service.out.log >&2 || true
-  tail -n 200 /var/log/buckyos.service.err.log >&2 || true
-  find "${REAL_BUCKYOS_ROOT}/logs/node_daemon" -maxdepth 1 -type f -print >&2 || true
-  launchctl print "system/buckyos.service" >&2 || true
+if [ ! -x "$RUNTIME_EXE" ]; then
+  echo "[buckyos] postinstall: missing or non-executable Runtime at $RUNTIME_EXE" >&2
   exit 1
+fi
+if ! /usr/bin/codesign --verify --strict "$RUNTIME_BUNDLE"; then
+  echo "[buckyos] postinstall: invalid signature on $RUNTIME_BUNDLE" >&2
+  exit 1
+fi
+
+TARGET_USER=""
+if [ -f "$BINDING_FILE" ]; then
+  TARGET_USER="$(/usr/bin/plutil -extract user raw -o - "$BINDING_FILE" 2>/dev/null)" || TARGET_USER=""
+fi
+[ -n "$TARGET_USER" ] || TARGET_USER="$(console_user)"
+if [ -z "$TARGET_USER" ]; then
+  echo "[buckyos] postinstall: no GUI user is logged in; files are installed and BuckyOS Runtime is waiting for its user."
+  echo "BuckyOS installed. Log in and open 'BuckyOS Runtime' (or BuckyOS) to finish setup for your account."
+  exit 0
+fi
+
+echo "[buckyos] postinstall: binding BuckyOS Runtime to $TARGET_USER"
+"$RUNTIME_EXE" service register --user "$TARGET_USER" --root "$REAL_BUCKYOS_ROOT"
+TARGET_UID="$(/usr/bin/id -u "$TARGET_USER")"
+refresh_runtime_registration "$TARGET_UID"
+
+if ! launchctl print "gui/$TARGET_UID" >/dev/null 2>&1; then
+  echo "[buckyos] postinstall: $TARGET_USER has no GUI session now; BuckyOS Runtime starts at the next login."
+  exit 0
+fi
+
+if ! "$RUNTIME_EXE" service start --root "$REAL_BUCKYOS_ROOT"; then
+  echo "[buckyos] postinstall: BuckyOS Runtime is installed but did not start; see the reason above." >&2
+elif ! wait_for_runtime "$TARGET_UID"; then
+  echo "[buckyos] postinstall: $RUNTIME_LABEL is registered but not running yet." >&2
+  launchctl print "gui/$TARGET_UID/$RUNTIME_LABEL" >&2 || true
+  tail -n 100 "${REAL_BUCKYOS_ROOT}/logs/node_daemon/launchd.err.log" >&2 || true
+  echo "[buckyos] postinstall: check ${REAL_BUCKYOS_ROOT}/logs/node_daemon/ or run: \"$RUNTIME_EXE\" service status" >&2
 fi
 
 echo "BuckyOS install success, open http://127.0.0.1:3182/index.html to start, ENJOY!"

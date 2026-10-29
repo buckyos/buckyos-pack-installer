@@ -68,7 +68,7 @@ def _expand_vars(s: str) -> str:
     """Expand environment variables in path strings."""
     out = s
     for name, default in [
-        ("BUCKYOS_ROOT", "C:\\opt\\buckyos"),
+        ("BUCKYOS_ROOT", "c:\\buckyos"),
         ("BUCKYOS_BUILD_ROOT", str(RESULT_ROOT_DIR)),
         ("APPDATA", os.environ.get("APPDATA") or "%APPDATA%"),
         ("LOCALAPPDATA", os.environ.get("LOCALAPPDATA") or "%LOCALAPPDATA%"),
@@ -769,7 +769,7 @@ def generate_nsis_script(
             platform_key="windows", architecture=architecture, version=version, package_format="exe",
         ),
         ARCH_INCLUDE='!include "x64.nsh"\n' if is_x64 else "",
-        DEFAULT_INSTALL_DIR=r"$PROGRAMFILES64\BuckyOS" if is_x64 else r"$PROGRAMFILES\BuckyOS",
+        DEFAULT_INSTALL_DIR=r"c:\buckyos",
         FINISH_PAGE_OPTIONS=render("FINISH_PAGE_OPTIONS", NAME=launch_bundle.name) if launch_bundle else "",
         LICENSE_PAGE=f'!insertmacro MUI_PAGE_LICENSE "{license_file}"\n' if license_file and license_file.exists() else "",
         VCREDIST_FUNCTIONS=(render("VCREDIST_FUNCTIONS", VCREDIST_PATH=_escape_nsis_path(str(bundled_vcredist)))

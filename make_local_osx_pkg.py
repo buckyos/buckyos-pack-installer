@@ -22,6 +22,7 @@ import argparse
 import json
 import os
 import platform
+import plistlib
 import shutil
 import subprocess
 import sys
@@ -562,8 +563,11 @@ def build_macos_distribution_pkg(
             version,
             "--install-location",
             "/",
-            str(pkg_path),
         ]
+        component_plist = work_dir / "components" / f"{_sanitize_id(comp.key)}.plist"
+        if _write_component_plist(component_root, component_plist, dry_run=dry_run):
+            cmd += ["--component-plist", str(component_plist)]
+        cmd.append(str(pkg_path))
 
         # Attach scripts for any component that provides templates in publish/macos_pkg/scripts/.
         templates_dir = resources_dir / "scripts"
@@ -614,6 +618,29 @@ def build_macos_distribution_pkg(
     ]
     _run(product_cmd, dry_run=dry_run)
     return out_pkg
+
+
+def _write_component_plist(component_root: Path, out_path: Path, *, dry_run: bool) -> bool:
+    """Pin every bundle of a component to its payload path.
+
+    Installer otherwise relocates a bundle to wherever LaunchServices last saw
+    the same bundle id (a dev rootfs, another copy of the app), which would
+    put the Runtime outside its BUCKYOS_ROOT.
+    """
+    if dry_run:
+        print(f"[dry-run] pkgbuild --analyze --root {component_root} {out_path}")
+        return False
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    subprocess.run(["pkgbuild", "--analyze", "--root", str(component_root), str(out_path)], check=True)
+    with out_path.open("rb") as handle:
+        bundles = plistlib.load(handle)
+    if not bundles:
+        return False
+    for bundle in bundles:
+        bundle["BundleIsRelocatable"] = False
+    with out_path.open("wb") as handle:
+        plistlib.dump(bundles, handle)
+    return True
 
 
 def _pkgutil_expand(pkg_path: Path, out_dir: Path) -> None:
@@ -919,36 +946,19 @@ def verify_pkg(
                             failures.append(
                                 f"buckyos postinstall missing data_paths install step for '{rel}': {snippet}"
                             )
-                required_postinstall_snippets = [
-                    'start_buckyos_service',
-                    'wait_for_node_daemon',
-                    'launchctl bootstrap system "$PLIST"',
-                    'launchctl kickstart -k "system/buckyos.service"',
-                    '/usr/bin/pgrep -f "${BUCKYOS_ROOT}/bin/node-daemon/node_daemon --enable_active"',
-                ]
-                for snippet in required_postinstall_snippets:
-                    if snippet not in postinstall_text:
-                        failures.append(f"buckyos postinstall missing startup check step: {snippet}")
-
-                data_block_end = postinstall_text.find("# END AUTO-GENERATED: data_paths")
-                start_call_idx = postinstall_text.rfind("\nstart_buckyos_service\n")
-                if data_block_end != -1 and start_call_idx != -1 and start_call_idx < data_block_end:
-                    failures.append("buckyos postinstall should start LaunchDaemon only after data_paths setup")
+                failures.extend(_verify_buckyos_postinstall(postinstall_text))
 
             preinstall_text = _pkg_script_text(buckyos_pkg_dir, "preinstall")
             if preinstall_text is None:
                 failures.append("buckyos missing preinstall script")
             else:
-                required_preinstall_snippets = [
-                    'checking Docker availability for LaunchDaemon/root',
-                    'command -v docker',
-                    'docker info',
-                    'OrbStack',
-                    'https://orbstack.dev/download',
-                ]
-                for snippet in required_preinstall_snippets:
-                    if snippet not in preinstall_text:
-                        failures.append(f"buckyos preinstall missing Docker/OrbStack check: {snippet}")
+                failures.extend(_verify_buckyos_preinstall(preinstall_text))
+
+            payload_failures, _ = _verify_runtime_payload(normalized_payload_files)
+            failures.extend(payload_failures)
+            package_info = buckyos_pkg_dir / "PackageInfo"
+            if package_info.exists() and "<relocate>" in package_info.read_text(encoding="utf-8", errors="ignore"):
+                failures.append("buckyos.pkg must not relocate bundles (BundleIsRelocatable=false)")
 
         else:
             failures.append("missing embedded buckyos.pkg (cannot verify data_paths semantics)")
@@ -973,6 +983,16 @@ def verify_pkg(
             if not payload_root.exists():
                 # Some pkgutil versions may extract payload directly under extract_dir.
                 payload_root = extract_dir
+
+            if subpkg_dir.name == "buckyos.pkg":
+                bundle = payload_root / RUNTIME_PAYLOAD_BUNDLE
+                checked = subprocess.run(
+                    ["codesign", "--verify", "--strict", "--verbose=2", str(bundle)],
+                    capture_output=True,
+                    text=True,
+                )
+                if checked.returncode != 0:
+                    failures.append(f"Runtime bundle signature invalid in payload: {checked.stderr.strip()}")
 
             for p in payload_root.rglob("*"):
                 if not p.is_file():
@@ -1016,6 +1036,72 @@ def verify_pkg(
 
     print("VERIFY PASS")
     return 0
+
+
+RUNTIME_PAYLOAD_BUNDLE = "opt/buckyos/bin/node-daemon/BuckyOS Runtime.app"
+
+
+def _verify_runtime_payload(payload_files: List[str]) -> Tuple[List[str], List[str]]:
+    """The Runtime bundle is the only node_daemon in the buckyos payload."""
+    failures: List[str] = []
+    executable = f"{RUNTIME_PAYLOAD_BUNDLE}/Contents/MacOS/node_daemon"
+    for required in (
+        executable,
+        f"{RUNTIME_PAYLOAD_BUNDLE}/Contents/Info.plist",
+        f"{RUNTIME_PAYLOAD_BUNDLE}/Contents/_CodeSignature/CodeResources",
+    ):
+        if required not in payload_files:
+            failures.append(f"buckyos payload missing Runtime bundle file: {required}")
+    copies = [
+        path
+        for path in payload_files
+        if path.startswith("opt/buckyos/bin/") and path.endswith("/node_daemon") and path != executable
+    ]
+    if copies:
+        failures.append(f"buckyos payload carries node_daemon outside the Runtime bundle: {', '.join(copies)}")
+    return failures, copies
+
+
+def _verify_buckyos_postinstall(text: str) -> List[str]:
+    failures: List[str] = []
+    for snippet in (
+        'RUNTIME_EXE="${RUNTIME_BUNDLE}/Contents/MacOS/node_daemon"',
+        '/usr/bin/codesign --verify --strict "$RUNTIME_BUNDLE"',
+        '"$RUNTIME_EXE" service register --user "$TARGET_USER" --root "$REAL_BUCKYOS_ROOT"',
+        '"$RUNTIME_EXE" service start --root "$REAL_BUCKYOS_ROOT"',
+        'launchctl print "gui/$TARGET_UID"',
+    ):
+        if snippet not in text:
+            failures.append(f"buckyos postinstall missing Runtime step: {snippet}")
+    for forbidden in ("/Library/LaunchDaemons", "bootstrap system", "/var/root", "/var/log/", "chown -R root"):
+        if forbidden in text:
+            failures.append(f"buckyos postinstall must not use the system service setup: {forbidden}")
+    data_block_end = text.find("# END AUTO-GENERATED: data_paths")
+    register_idx = text.find('service register --user')
+    if data_block_end != -1 and register_idx != -1 and register_idx < data_block_end:
+        failures.append("buckyos postinstall should bind the Runtime user only after data_paths setup")
+    no_user_idx = text.find('if [ -z "$TARGET_USER" ]; then')
+    if no_user_idx == -1 or "exit 0" not in text[no_user_idx:register_idx]:
+        failures.append("buckyos postinstall should finish successfully when no GUI user is logged in")
+    return failures
+
+
+def _verify_buckyos_preinstall(text: str) -> List[str]:
+    failures: List[str] = []
+    for snippet in (
+        'launchctl bootout "gui/$uid/$RUNTIME_LABEL"',
+        'rm -f "$LEGACY_DAEMON_PLIST"',
+        "docker info",
+        "https://orbstack.dev/download",
+        'stop_osx.sh',
+    ):
+        if snippet not in text:
+            failures.append(f"buckyos preinstall missing step: {snippet}")
+    check_start = text.find("check_user_docker() {")
+    check_end = text.find("\n}\n", check_start)
+    if check_start == -1 or "exit 1" in text[check_start:check_end]:
+        failures.append("buckyos preinstall must not block installation on Docker readiness")
+    return failures
 
 
 def _safe_join(root: Path, rel: str) -> Path:

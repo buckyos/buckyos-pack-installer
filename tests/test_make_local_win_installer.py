@@ -18,12 +18,12 @@ class WindowsPackagerTests(unittest.TestCase):
                     winpkg.PublishComponent(
                         key="buckyos", name="BuckyOS Service", kind="app",
                         optional=True, default_selected=True, src=None,
-                        default_target="C:\\BuckyOS", system_service=True,
+                        default_target="c:\\buckyos", system_service=True,
                     ),
                     winpkg.PublishComponent(
                         key="BuckyOSApp", name="BuckyOS App", kind="bundle",
                         optional=True, default_selected=True, src="buckyosapp.exe",
-                        default_target="C:\\BuckyOS\\BuckyOSApp", system_service=False,
+                        default_target="c:\\buckyos\\BuckyOSApp", system_service=False,
                     ),
                 ]
                 for comp in components:
@@ -76,7 +76,7 @@ class WindowsPackagerTests(unittest.TestCase):
 
             layout = winpkg.AppLayout(
                 source_rootfs=src,
-                target_rootfs=Path("C:/BuckyOS"),
+                target_rootfs=Path("c:/buckyos"),
                 module_paths=["buckyos"],
                 data_paths=[],
                 clean_paths=[],
@@ -99,7 +99,7 @@ class WindowsPackagerTests(unittest.TestCase):
 
             layout = winpkg.AppLayout(
                 source_rootfs=src,
-                target_rootfs=Path("C:/BuckyOS/tool"),
+                target_rootfs=Path("c:/buckyos/tool"),
                 module_paths=["tool"],
                 data_paths=[],
                 clean_paths=[],
@@ -133,7 +133,7 @@ class WindowsPackagerTests(unittest.TestCase):
                         optional=True,
                         default_selected=True,
                         src="buckyosapp.exe",
-                        default_target="C:\\BuckyOS\\BuckyOSApp",
+                        default_target="c:\\buckyos\\BuckyOSApp",
                         system_service=False,
                     )
                 ],
@@ -179,7 +179,7 @@ class WindowsPackagerTests(unittest.TestCase):
                         optional=True,
                         default_selected=True,
                         src=None,
-                        default_target="C:\\BuckyOS\\",
+                        default_target="c:\\buckyos\\",
                         system_service=True,
                     )
                 ],
@@ -216,7 +216,7 @@ class WindowsPackagerTests(unittest.TestCase):
                         optional=True,
                         default_selected=True,
                         src=None,
-                        default_target="C:\\BuckyOS\\",
+                        default_target="c:\\buckyos\\",
                         system_service=True,
                     )
                 ],

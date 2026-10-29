@@ -2,8 +2,11 @@
 set -e
 export PATH="/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:${PATH:-}"
 BUCKYOS_ROOT="${BUCKYOS_ROOT:-/opt/buckyos}"
-DAEMON_PLIST="/Library/LaunchDaemons/buckyos.service.plist"
-AGENT_PLIST="/Library/LaunchAgents/buckyos.service.plist"
+BINDING_FILE="$BUCKYOS_ROOT/etc/desktop_runtime.json"
+RUNTIME_LABEL="com.buckyos.runtime"
+# Pre-LaunchAgent installs registered these; they are removed, never reused.
+LEGACY_DAEMON_PLIST="/Library/LaunchDaemons/buckyos.service.plist"
+LEGACY_AGENT_PLIST="/Library/LaunchAgents/buckyos.service.plist"
 
 run_with_timeout() {
   # macOS doesn't ship GNU timeout; use perl alarm for a best-effort timeout.
@@ -13,80 +16,91 @@ run_with_timeout() {
   /usr/bin/perl -e '$t=shift; alarm $t; exec @ARGV' "$seconds" "$@"
 }
 
+bound_user() {
+  local user
+  [ -f "$BINDING_FILE" ] || return 0
+  user="$(/usr/bin/plutil -extract user raw -o - "$BINDING_FILE" 2>/dev/null)" || return 0
+  printf '%s\n' "$user"
+}
+
+console_user() {
+  local user
+  user="$(/usr/bin/stat -f%Su /dev/console 2>/dev/null || true)"
+  case "$user" in
+    ""|root|loginwindow|_mbsetupuser) return 0 ;;
+  esac
+  printf '%s\n' "$user"
+}
+
 print_docker_help() {
-  cat >&2 <<'EOF'
-[buckyos] preinstall: Docker is required and must be available to macOS LaunchDaemon (root).
-[buckyos] preinstall: Please install and start OrbStack first, then run this installer again.
-[buckyos] preinstall: Download: https://orbstack.dev/download
-EOF
+  cat >&2 <<'EOF2'
+[buckyos] preinstall: BuckyOS apps run in Docker containers of the Runtime user.
+[buckyos] preinstall: Install and start OrbStack (https://orbstack.dev/download) for that user;
+[buckyos] preinstall: the Runtime keeps waiting for Docker and deploys apps once it is ready.
+EOF2
 }
 
-ensure_launchdaemon_docker() {
-  echo "[buckyos] preinstall: checking Docker availability for LaunchDaemon/root"
-  if ! command -v docker >/dev/null 2>&1; then
+check_user_docker() {
+  local user="$1"
+  if [ -z "$user" ]; then
+    echo "[buckyos] preinstall: no Runtime user yet; Docker is checked in that user's session later"
+    return 0
+  fi
+  echo "[buckyos] preinstall: checking Docker for $user"
+  if ! /usr/bin/sudo -u "$user" -H /bin/sh -c "PATH='$PATH'; command -v docker" >/dev/null 2>&1; then
+    echo "[buckyos] preinstall: docker CLI not found for $user" >&2
     print_docker_help
-    exit 1
+    return 0
   fi
-  if ! run_with_timeout 15 docker info >/dev/null 2>&1; then
-    echo "[buckyos] preinstall: Docker CLI exists, but root/LaunchDaemon cannot access Docker." >&2
+  if ! run_with_timeout 15 /usr/bin/sudo -u "$user" -H /bin/sh -c "PATH='$PATH'; docker info" >/dev/null 2>&1; then
+    echo "[buckyos] preinstall: Docker is not reachable for $user right now" >&2
     print_docker_help
-    exit 1
   fi
 }
 
-stop_buckyos_containers() {
-  echo "[buckyos] preinstall: stopping BuckyOS docker containers (best effort)"
-  local raw_container_ids
-  local container_ids
-  raw_container_ids="$(docker ps -aq --filter "label=buckyos.app_instance_id" 2>/dev/null || true)"
-  if [ -z "$raw_container_ids" ]; then
-    echo "[buckyos] preinstall: no BuckyOS docker containers found"
-    return
+stop_legacy_services() {
+  if [ -f "$LEGACY_DAEMON_PLIST" ]; then
+    echo "[buckyos] preinstall: removing legacy system LaunchDaemon $LEGACY_DAEMON_PLIST"
+    # Don't use kickstart here: it may start (or wait for) the job and block in installer context.
+    launchctl disable "system/buckyos.service" >/dev/null 2>&1 || true
+    run_with_timeout 10 launchctl bootout system "$LEGACY_DAEMON_PLIST" >/dev/null 2>&1 || true
+    rm -f "$LEGACY_DAEMON_PLIST" >/dev/null 2>&1 || true
   fi
-  container_ids=("${(@f)raw_container_ids}")
-
-  run_with_timeout 20 docker rm -f "${container_ids[@]}" >/dev/null 2>&1 || {
-    echo "[buckyos] preinstall: failed to remove BuckyOS docker containers" >&2
-  }
+  if [ -f "$LEGACY_AGENT_PLIST" ]; then
+    local user uid
+    user="$(console_user)"
+    if [ -n "$user" ]; then
+      uid="$(/usr/bin/id -u "$user" 2>/dev/null || true)"
+      [ -n "$uid" ] && run_with_timeout 10 launchctl bootout "gui/$uid" "$LEGACY_AGENT_PLIST" >/dev/null 2>&1 || true
+    fi
+    rm -f "$LEGACY_AGENT_PLIST" >/dev/null 2>&1 || true
+  fi
 }
 
-run_existing_stop_script() {
-  echo "[buckyos] preinstall: running existing stop script (best effort)"
+stop_runtime() {
+  local user uid
+  user="$(bound_user)"
+  if [ -n "$user" ]; then
+    uid="$(/usr/bin/id -u "$user" 2>/dev/null || true)"
+    if [ -n "$uid" ]; then
+      echo "[buckyos] preinstall: stopping $RUNTIME_LABEL of $user before replacing the Runtime"
+      run_with_timeout 40 launchctl bootout "gui/$uid/$RUNTIME_LABEL" >/dev/null 2>&1 || true
+    fi
+  fi
   if [ -f "$BUCKYOS_ROOT/bin/stop_osx.sh" ]; then
-    run_with_timeout 30 /bin/sh "$BUCKYOS_ROOT/bin/stop_osx.sh" >/dev/null 2>&1 || {
+    run_with_timeout 60 /usr/bin/env BUCKYOS_ROOT="$BUCKYOS_ROOT" /bin/sh "$BUCKYOS_ROOT/bin/stop_osx.sh" || {
       echo "[buckyos] preinstall: existing stop_osx.sh failed" >&2
     }
-    return
   fi
-
-  if [ -f "$BUCKYOS_ROOT/bin/stop.py" ] && command -v python3 >/dev/null 2>&1; then
-    run_with_timeout 30 python3 "$BUCKYOS_ROOT/bin/stop.py" >/dev/null 2>&1 || {
-      echo "[buckyos] preinstall: existing stop.py failed" >&2
-    }
-    return
-  fi
-
-  stop_buckyos_containers
 }
 
-ensure_launchdaemon_docker
+TARGET_USER="$(bound_user)"
+[ -n "$TARGET_USER" ] || TARGET_USER="$(console_user)"
+check_user_docker "$TARGET_USER"
 
 echo "[buckyos] preinstall: stopping service (best effort)"
-# Don't use kickstart here: it may start (or wait for) the job and block in installer context.
-launchctl disable "system/buckyos.service" >/dev/null 2>&1 || true
-run_with_timeout 10 launchctl bootout system "$DAEMON_PLIST" >/dev/null 2>&1 || true
-rm -f "$DAEMON_PLIST" >/dev/null 2>&1 || true
-
-CONSOLE_USER="$(/usr/bin/stat -f%Su /dev/console 2>/dev/null || true)"
-if [ -n "$CONSOLE_USER" ] && [ "$CONSOLE_USER" != "root" ] && [ "$CONSOLE_USER" != "loginwindow" ]; then
-  CONSOLE_UID="$(/usr/bin/id -u "$CONSOLE_USER" 2>/dev/null || true)"
-  if [ -n "$CONSOLE_UID" ]; then
-    run_with_timeout 10 launchctl bootout "gui/$CONSOLE_UID" "$AGENT_PLIST" >/dev/null 2>&1 || true
-  fi
-fi
-rm -f "$AGENT_PLIST" >/dev/null 2>&1 || true
-
-run_existing_stop_script
+stop_legacy_services
+stop_runtime
 
 echo "[buckyos] preinstall: remove module paths (keep data)"
 # BEGIN AUTO-GENERATED: modules

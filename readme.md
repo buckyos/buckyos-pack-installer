@@ -46,6 +46,18 @@ manifest 会固化：
 - macOS / Linux 默认 `/opt/buckyosci`
 - Windows 默认 `C:\opt\buckyosci`
 
+## macOS Runtime 与安装流程
+
+macOS 上 node_daemon 以 `bin/node-daemon/BuckyOS Runtime.app`（Bundle ID / launchd label `com.buckyos.runtime`）交付，已安装产物只有 bundle 内这一份 `Contents/MacOS/node_daemon`：
+
+- 模板：`src/kernel/node_daemon/macos/`（`Info.plist`、图标）；版本取 `src/VERSION`。
+- 组装：`src/tools/macos_runtime_bundle.py assemble` 把 Cargo 输出的裸 `node_daemon` 移进 bundle，签名后校验；`buckyos-build.py`、`make_local_pkg.py` prepare、CI（`build-macos.yml`、`dev-tests.yml`）在 `buckyos-build` 之后调用。直接运行 devkit 的 `buckyos-build` 需要手动补这一步。
+- 签名：`BUCKYOS_MACOS_CODESIGN_IDENTITY` 指定正式身份（启用 hardened runtime 与 timestamp）；未设置时为 ad-hoc 签名，只用于开发，其 TCC 授权会随每次构建失效，不能证明发布版的授权连续性。签名之后不再改动 bundle。
+- 打包：pkgbuild 的 component plist 把所有 bundle 固定为 `BundleIsRelocatable=false`，避免 Installer 把 Runtime 或 App 装到 LaunchServices 记录的其他副本位置。`verify-pkg` 检查唯一 Runtime 主程序、bundle 签名、不可重定位，以及 pre/postinstall 走用户 LaunchAgent。
+- preinstall：停止绑定用户的 `com.buckyos.runtime` 与本实例进程（`bin/stop_osx.sh`），清除旧版 `/Library/LaunchDaemons/buckyos.service.plist`；Docker/OrbStack 在 Runtime 用户上下文检查，未就绪只提示，不阻断安装。
+- postinstall：校验 bundle 签名，按 `etc/desktop_runtime.json` 或当前 GUI 用户执行 `node_daemon service register --user <u>`（root 交给该用户，bundle 保持 root 所有），用户已登录 GUI 时 `service start`；没有 GUI 用户时安装照常成功，首次打开 BuckyOS Runtime（或托盘“完成设置”）时经管理员授权完成绑定。
+- 本地管理：`"<root>/bin/node-daemon/BuckyOS Runtime.app/Contents/MacOS/node_daemon" service status|start|stop|restart|autostart on|off|unregister`；卸载用 `uv run src/uninstall.py`（先停实例，再注销登录项与绑定）。
+
 ## Platform Commands
 
 macOS:
