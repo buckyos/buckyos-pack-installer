@@ -718,6 +718,27 @@ def _rpm_query(pkg_path: Path, args: List[str]) -> str:
     return result.stdout
 
 
+def _verify_rpm_ext_tools(pkg_path: Path, failures: List[str], *, required: bool) -> None:
+    if shutil.which("rpm2cpio") is None or shutil.which("cpio") is None:
+        failures.append("rpm2cpio and cpio are required to verify the ext-core tar")
+        return
+    with tempfile.TemporaryDirectory(prefix="buckyos-rpm-ext-tools-") as td:
+        extract_dir = Path(td)
+        rpm2cpio = subprocess.Popen(["rpm2cpio", str(pkg_path)], stdout=subprocess.PIPE)
+        cpio = subprocess.run(
+            ["cpio", "-idm", "--quiet", "./opt/buckyos/bin/ext-tools/*"],
+            stdin=rpm2cpio.stdout,
+            cwd=extract_dir,
+            capture_output=True,
+            text=True,
+        )
+        rpm2cpio.stdout.close()
+        if rpm2cpio.wait() != 0 or cpio.returncode != 0:
+            failures.append(f"rpm ext-tools extraction failed: {cpio.stderr.strip()}")
+            return
+        common.verify_ext_tools(extract_dir, failures, required=required)
+
+
 def _verify_rpm_paios_images(pkg_path: Path, arch: str, failures: List[str], *, required: bool) -> None:
     if shutil.which("rpm2cpio") is None or shutil.which("cpio") is None:
         failures.append("rpm2cpio and cpio are required to verify paios image tarballs")
@@ -762,6 +783,7 @@ def verify_pkg(
     project_yaml_path: Path,
     manifest_path: Path | None = None,
     require_paios_images: bool = False,
+    require_ext_tools: bool = False,
 ) -> int:
     if not pkg_path.exists():
         print(f"VERIFY FAIL: .rpm not found: {pkg_path}")
@@ -785,6 +807,8 @@ def verify_pkg(
         print("[verify] Warning: rpm command not found, skipping rpm metadata inspection")
         if require_paios_images:
             failures.append("rpm is required to verify paios image tarballs")
+        if require_ext_tools:
+            failures.append("rpm is required to verify the ext-core tar")
     else:
         arch = ""
         payload_paths: List[str] = []
@@ -835,6 +859,8 @@ def verify_pkg(
 
         if require_paios_images or any(path.endswith("/bin/paios-images/" + common.PAIOS_IMAGES_MANIFEST) for path in payload_paths):
             _verify_rpm_paios_images(pkg_path, arch, failures, required=require_paios_images)
+        if require_ext_tools or any(path.endswith("/bin/ext-tools/" + common.EXT_TOOLS_MANIFEST) for path in payload_paths):
+            _verify_rpm_ext_tools(pkg_path, failures, required=require_ext_tools)
 
         try:
             scripts_text = _rpm_query(pkg_path, ["-qp", "--scripts"])
@@ -929,6 +955,7 @@ def main(argv: List[str]) -> int:
     p_verify.add_argument("--project", default=str(PROJECT_YAML), help="Path to bucky_project.yaml")
     p_verify.add_argument("--manifest", default=None, help="Path to generated project manifest JSON")
     p_verify.add_argument("--require-paios-images", action="store_true", help="Fail unless bin/paios-images/ carries the manifest and the target-arch image tarballs")
+    p_verify.add_argument("--require-ext-tools", action="store_true", help="Fail unless bin/ext-tools/ carries the manifest and an ext-core tar matching it")
 
     args = parser.parse_args(argv[1:])
 
@@ -952,6 +979,7 @@ def main(argv: List[str]) -> int:
             project_yaml_path=Path(args.project),
             manifest_path=Path(args.manifest).resolve() if args.manifest else None,
             require_paios_images=bool(args.require_paios_images),
+            require_ext_tools=bool(args.require_ext_tools),
         )
 
     return 1

@@ -1001,6 +1001,7 @@ def verify_pkg(
     project_yaml_path: Path,
     manifest_path: Path | None = None,
     require_paios_images: bool = False,
+    require_ext_tools: bool = False,
 ) -> int:
     """
     Verify a built Windows installer using 7zip.
@@ -1042,6 +1043,8 @@ def verify_pkg(
         print("[verify] Install 7-Zip from https://www.7-zip.org/ for full verification")
         if require_paios_images:
             failures.append("7-Zip is required to verify paios image tarballs")
+        if require_ext_tools:
+            failures.append("7-Zip is required to verify the ext-core tar")
     else:
         with tempfile.TemporaryDirectory(prefix="buckyos-verify-") as td:
             work = Path(td)
@@ -1061,6 +1064,7 @@ def verify_pkg(
                     failures,
                     required=require_paios_images,
                 )
+                common.verify_ext_tools(extract_dir, failures, required=require_ext_tools)
                 extracted_basenames = {
                     path.name.lower()
                     for path in extract_dir.rglob("*")
@@ -1339,6 +1343,7 @@ def main(argv: List[str]) -> int:
     p_verify.add_argument("--project", default=str(PROJECT_YAML), help="Path to bucky_project.yaml")
     p_verify.add_argument("--manifest", default=None, help="Path to generated project manifest JSON")
     p_verify.add_argument("--require-paios-images", action="store_true", help="Fail unless bin/paios-images/ carries the manifest and the target-arch image tarballs")
+    p_verify.add_argument("--require-ext-tools", action="store_true", help="Fail unless bin/ext-tools/ carries the manifest and an ext-core tar matching it")
 
     # sync command
     p_sync = sub.add_parser("sync", help="Regenerate PowerShell scripts from bucky_project.yaml")
@@ -1370,6 +1375,7 @@ def main(argv: List[str]) -> int:
             project_yaml_path=Path(args.project),
             manifest_path=Path(args.manifest).resolve() if args.manifest else None,
             require_paios_images=bool(args.require_paios_images),
+            require_ext_tools=bool(args.require_ext_tools),
         )
 
     if args.cmd == "sync":

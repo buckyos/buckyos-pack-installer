@@ -739,6 +739,7 @@ def verify_pkg(
     project_yaml_path: Path,
     manifest_path: Path | None = None,
     require_paios_images: bool = False,
+    require_ext_tools: bool = False,
 ) -> int:
     """
     Offline verification for the built macOS .pkg.
@@ -850,7 +851,7 @@ def verify_pkg(
             paios_dir.mkdir()
             extracted = subprocess.run(
                 ["tar", "-xf", str(buckyos_pkg_dir / "Payload"), "-C", str(paios_dir),
-                 "--include", "*bin/paios-images/*"],
+                 "--include", "*bin/paios-images/*", "--include", "*bin/ext-tools/*"],
                 capture_output=True,
                 text=True,
             )
@@ -863,8 +864,9 @@ def verify_pkg(
                     failures,
                     required=require_paios_images,
                 )
-        elif require_paios_images:
-            failures.append("buckyos.pkg Payload is missing; cannot verify paios image tarballs")
+                common.verify_ext_tools(paios_dir, failures, required=require_ext_tools)
+        elif require_paios_images or require_ext_tools:
+            failures.append("buckyos.pkg Payload is missing; cannot verify paios image tarballs or the ext-core tar")
         if buckyos_pkg_dir.exists():
             layout = resolve_app_layout(
                 app_key="buckyos",
@@ -1369,6 +1371,7 @@ def main(argv: List[str]) -> int:
     p_verify.add_argument("--project", default=str(PROJECT_YAML), help="Path to bucky_project.yaml")
     p_verify.add_argument("--manifest", default=None, help="Path to generated project manifest JSON")
     p_verify.add_argument("--require-paios-images", action="store_true", help="Fail unless bin/paios-images/ carries the manifest and the target-arch image tarballs")
+    p_verify.add_argument("--require-ext-tools", action="store_true", help="Fail unless bin/ext-tools/ carries the manifest and an ext-core tar matching it")
 
     for name in ("install", "update", "uninstall"):
         p = sub.add_parser(name, help=f"Local filesystem action: {name}")
@@ -1413,6 +1416,7 @@ def main(argv: List[str]) -> int:
             project_yaml_path=Path(args.project),
             manifest_path=Path(args.manifest).resolve() if args.manifest else None,
             require_paios_images=bool(args.require_paios_images),
+            require_ext_tools=bool(args.require_ext_tools),
         )
 
     layout = resolve_app_layout(

@@ -335,6 +335,52 @@ def _sha256_file(path: Path) -> str:
     return digest.hexdigest()
 
 
+EXT_TOOLS_MANIFEST = "ext_tools.json"
+
+
+def verify_ext_tools(extract_root: Path, failures: list[str], *, required: bool) -> None:
+    """Check the bundled ext-core seed against bin/ext-tools/ext_tools.json.
+
+    node_daemon unpacks it on first start; the installer only carries the file. The manifest
+    lists every platform of the release, a package carries the tar of its own, so at least one
+    entry must be there and whatever is there must match. Files are located by name because
+    some extractors (NSIS) flatten directories.
+    """
+    manifests = [path for path in extract_root.rglob(EXT_TOOLS_MANIFEST) if path.is_file()]
+    if not manifests:
+        if required:
+            failures.append(f"payload has no bin/ext-tools/{EXT_TOOLS_MANIFEST}")
+        return
+    if len(manifests) > 1:
+        failures.append(f"payload has {len(manifests)} copies of {EXT_TOOLS_MANIFEST}")
+        return
+    try:
+        manifest = json.loads(manifests[0].read_text(encoding="utf-8"))
+        if manifest.get("schema") != "buckyos.ext-tools/v1":
+            raise ValueError("unsupported schema")
+        platforms = manifest["packages"]["ext-core"]["platforms"]
+    except (OSError, ValueError, KeyError, TypeError) as error:
+        failures.append(f"invalid {EXT_TOOLS_MANIFEST}: {error}")
+        return
+    found = 0
+    for platform, entry in platforms.items():
+        file_name = str(entry.get("file", ""))
+        if not file_name or "/" in file_name or "\\" in file_name or ".." in file_name:
+            failures.append(f"{EXT_TOOLS_MANIFEST} {platform} has an invalid file {file_name!r}")
+            continue
+        matches = [path for path in extract_root.rglob(file_name) if path.is_file()]
+        if not matches:
+            continue
+        found += 1
+        size = matches[0].stat().st_size
+        if size != entry.get("size") or "sha256:" + _sha256_file(matches[0]) != entry.get("sha256"):
+            failures.append(f"ext-core tar {file_name} does not match {EXT_TOOLS_MANIFEST}")
+        else:
+            print(f"[verify] ext-core {platform}: {file_name} ({size / (1024 * 1024):.1f} MB) OK")
+    if required and found == 0:
+        failures.append(f"payload carries no ext-core tar listed in {EXT_TOOLS_MANIFEST}")
+
+
 def verify_paios_images(extract_root: Path, raw_arch: str, failures: list[str], *, required: bool) -> None:
     """Check bundled paios image tarballs against bin/paios-images/paios_images.json.
 

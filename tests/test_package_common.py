@@ -189,6 +189,43 @@ class PackageCommonTests(unittest.TestCase):
         self.assertEqual(unexpected, ["opt/buckyos/data/user.db"])
 
 
+    def test_verify_ext_tools(self) -> None:
+        import hashlib
+
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            failures: list[str] = []
+            common.verify_ext_tools(root, failures, required=False)
+            self.assertEqual(failures, [])
+            common.verify_ext_tools(root, failures, required=True)
+            self.assertEqual(len(failures), 1)
+
+            directory = root / "opt/buckyos/bin/ext-tools"
+            directory.mkdir(parents=True)
+            data = b"payload"
+            (directory / "ext_tools.json").write_text(json.dumps({
+                "schema": "buckyos.ext-tools/v1",
+                "packages": {"ext-core": {"version": "1.0.0", "platforms": {
+                    "linux-x86_64": {"file": "ext-core-linux-x86_64.tar.gz", "size": len(data), "sha256": "sha256:" + hashlib.sha256(data).hexdigest()},
+                    "darwin-arm64": {"file": "ext-core-darwin-arm64.tar.gz", "size": 1, "sha256": "sha256:0"},
+                }}},
+            }), encoding="utf-8")
+            failures = []
+            common.verify_ext_tools(root, failures, required=False)
+            self.assertEqual(failures, [], "the manifest lists platforms this package does not carry")
+            common.verify_ext_tools(root, failures, required=True)
+            self.assertEqual(len(failures), 1)
+            self.assertIn("no ext-core tar", failures[0])
+
+            (directory / "ext-core-linux-x86_64.tar.gz").write_bytes(data)
+            failures = []
+            common.verify_ext_tools(root, failures, required=True)
+            self.assertEqual(failures, [])
+
+            (directory / "ext-core-linux-x86_64.tar.gz").write_bytes(b"tampered")
+            common.verify_ext_tools(root, failures, required=True)
+            self.assertIn("does not match", failures[0])
+
     def test_verify_paios_images(self) -> None:
         import hashlib
 
