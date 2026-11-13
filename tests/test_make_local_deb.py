@@ -10,6 +10,24 @@ import make_local_deb as debpkg  # noqa: E402
 
 
 class DebianPackagerTests(unittest.TestCase):
+    def test_license_payload_paths_are_allowed_without_opening_other_share_paths(self) -> None:
+        layout = debpkg.AppLayout(
+            source_rootfs=Path("/stage/buckyos"), target_rootfs=Path("/opt/buckyos"),
+            module_paths=[], data_paths=[], clean_paths=[], module_source_paths={}, data_source_paths={},
+        )
+        failures: list[str] = []
+        paths = ["/opt/buckyos/share", "/opt/buckyos/share/licenses/cyfs-gateway/LICENSE", "/opt/buckyos/licenses/buckyos/NOTICE"]
+        debpkg._verify_linux_payload_contract(
+            payload_paths=paths, layout=layout, failures=failures,
+            package_kind="deb", include_systemd_service=False,
+        )
+        self.assertEqual(failures, [])
+        debpkg._verify_linux_payload_contract(
+            payload_paths=paths + ["/opt/buckyos/share/unrelated.txt"], layout=layout, failures=failures,
+            package_kind="deb", include_systemd_service=False,
+        )
+        self.assertTrue(any("share/unrelated.txt" in failure for failure in failures))
+
     def _write_project(self, path: Path) -> None:
         path.write_text(
             """

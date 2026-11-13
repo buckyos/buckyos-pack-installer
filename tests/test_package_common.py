@@ -13,6 +13,33 @@ import package_common as common
 
 
 class PackageCommonTests(unittest.TestCase):
+    def test_stage_licenses_preserves_main_gateway_and_installer_materials(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            source, destination = Path(td) / "source", Path(td) / "payload"
+            materials = {
+                "licenses/buckyos/NOTICE": b"main notice\n",
+                "licenses/buckyos/source.json": b'{"commit": "fixture"}\n',
+                "share/licenses/cyfs-gateway/LICENSE": b"gateway license\n",
+                "share/licenses/cyfs-gateway/NOTICE": b"gateway notice\n",
+            }
+            for name, content in materials.items():
+                path = source / name
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_bytes(content)
+            (source / "share/unrelated.txt").write_bytes(b"not a license\n")
+            common.stage_licenses(source, destination)
+            for name, content in materials.items():
+                self.assertEqual((destination / name).read_bytes(), content)
+            self.assertFalse((destination / "share/unrelated.txt").exists())
+            for name in ("LICENSE", "NOTICE", "license.md", "license-cn.md"):
+                self.assertEqual(
+                    (destination / "licenses/installer" / name).read_bytes(),
+                    (Path(common.__file__).parent / name).read_bytes(),
+                )
+            common.stage_licenses(destination, destination)
+            for name, content in materials.items():
+                self.assertEqual((destination / name).read_bytes(), content)
+
     def test_project_load_file_accepts_json(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             project = Path(td) / "bucky_project.json"

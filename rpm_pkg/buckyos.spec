@@ -3,7 +3,8 @@ Name: buckyos
 Version: {{rpm_version}}
 Release: {{rpm_release}}
 Summary: BuckyOS system software
-License: Proprietary
+License: AGPL-3.0-only AND Apache-2.0
+# Third-party components retain the licenses in the installed licenses/ inventory.
 URL: https://buckyos.org
 AutoReqProv: no
 

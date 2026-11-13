@@ -398,6 +398,8 @@ def _stage_buckyos_app_root(*, src_root: Path, dst_root: Path, layout: AppLayout
             d.parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(s, d)
 
+    common.stage_licenses(src_root, dst_root)
+
 def _run(cmd: List[str], dry_run: bool) -> None:
     print("+", " ".join(cmd))
     if dry_run:

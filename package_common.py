@@ -428,3 +428,16 @@ def verify_paios_images(extract_root: Path, raw_arch: str, failures: list[str], 
             failures.append(f"paios image tarball {file_name} does not match {PAIOS_IMAGES_MANIFEST}")
         else:
             print(f"[verify] paios image {name} {arch}: {file_name} ({size / (1024 * 1024):.1f} MB) OK")
+
+
+def stage_licenses(source: Path, destination: Path) -> None:
+    """Keep component notices and installer terms in the installed payload."""
+    for relative in (Path("licenses"), Path("share/licenses")):
+        component_licenses = source / relative
+        target = destination / relative
+        if component_licenses.is_dir() and component_licenses.resolve() != target.resolve():
+            shutil.copytree(component_licenses, target, dirs_exist_ok=True)
+    installer = destination / "licenses/installer"
+    installer.mkdir(parents=True, exist_ok=True)
+    for name in ("LICENSE", "NOTICE", "license.md", "license-cn.md"):
+        shutil.copy2(Path(__file__).resolve().parent / name, installer / name)

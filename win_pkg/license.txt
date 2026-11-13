@@ -75,7 +75,11 @@ Unless otherwise expressly provided by the applicable open-source license, the r
 
 4.1 Applicable License Prevails
 
-The source code and distributable versions of the Software may be subject to GPL, GPL-compatible licenses, or other open-source licenses expressly identified by the Project. The specific scope of permission, conditions, and obligations shall be governed by the license text actually accompanying the release of the Software or clearly linked at the time of release.
+The installer tooling in buckyos-pack-installer and the BuckyOSApp desktop client are licensed under the Apache License, Version 2.0 (Apache-2.0). The BuckyOS runtime from the buckyos repository is licensed under the GNU Affero General Public License, version 3 only (AGPL-3.0-only). Third-party libraries, tools, assets, and other separately licensed components retain their own licenses and notices; neither project license replaces those terms.
+
+The applicable open-source licenses, rather than acceptance of this Agreement or any online-service terms, govern the rights to run, study, copy, modify, and redistribute the Software Itself. No restriction, approval requirement, or future amendment in this Agreement adds conditions to those rights. Separate service terms apply only to the relevant optional services. Distribution obligations, including required notices and corresponding source, remain governed by each component's license.
+
+Licenses and source repositories: https://github.com/buckyos/buckyos-pack-installer (Apache-2.0), https://github.com/buckyos/BuckyOSApp (Apache-2.0), https://github.com/buckyos/buckyos (AGPL-3.0-only). Component notices accompany the installed distribution under licenses/.
 
 4.2 Users’ Basic Freedoms
 

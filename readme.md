@@ -138,3 +138,9 @@ Unix moves restrict the file to `0600`. Identical duplicates are removed;
 different copies or linked config/security paths fail without overwriting either
 config. This restores bootstrap after an identity-preserving data cleanup.
 Existing installer artifacts require rebuilding to include this hook change.
+
+## License
+
+Project-authored code is licensed under [Apache-2.0](LICENSE). See [NOTICE](NOTICE) for retained notices. Third-party dependencies and bundled assets keep their own licenses. The separately installed BuckyOS runtime is [AGPL-3.0-only](https://github.com/buckyos/buckyos/blob/main/LICENSE); this repository's Apache license does not replace its terms or those of other bundled programs.
+
+Installers carry component notices under `licenses/`, including this installer's Apache license and the bilingual end-user terms under `licenses/installer/`. A package inventory or binary download URL does not replace any obligation to provide corresponding source.

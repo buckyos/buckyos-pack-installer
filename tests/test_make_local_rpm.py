@@ -10,6 +10,24 @@ import make_local_rpm as rpm
 
 
 class MakeLocalRpmTests(unittest.TestCase):
+    def test_license_payload_paths_are_allowed_without_opening_other_share_paths(self) -> None:
+        layout = rpm.AppLayout(
+            source_rootfs=Path("/stage/buckyos"), target_rootfs=Path("/opt/buckyos"),
+            module_paths=[], data_paths=[], clean_paths=[], module_source_paths={}, data_source_paths={},
+        )
+        failures: list[str] = []
+        paths = ["/opt/buckyos/share", "/opt/buckyos/share/licenses/cyfs-gateway/LICENSE", "/opt/buckyos/licenses/buckyos/NOTICE"]
+        rpm._verify_linux_payload_contract(
+            payload_paths=paths, layout=layout, failures=failures,
+            package_kind="rpm", include_systemd_service=False,
+        )
+        self.assertEqual(failures, [])
+        rpm._verify_linux_payload_contract(
+            payload_paths=paths + ["/opt/buckyos/share/unrelated.txt"], layout=layout, failures=failures,
+            package_kind="rpm", include_systemd_service=False,
+        )
+        self.assertTrue(any("share/unrelated.txt" in failure for failure in failures))
+
     def test_rpm_arch_and_version_release(self) -> None:
         self.assertEqual(rpm._rpm_arch("amd64"), "x86_64")
         self.assertEqual(rpm._rpm_arch("arm64"), "aarch64")

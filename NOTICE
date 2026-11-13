@@ -1,0 +1,6 @@
+buckyos-pack-installer
+
+Project-authored code in this repository is licensed under Apache-2.0.
+Third-party components retain their own copyright notices and licenses.
+The separately distributed BuckyOS runtime is licensed under AGPL-3.0-only.
+This notice does not relicense bundled dependencies or external programs.

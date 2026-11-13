@@ -217,6 +217,8 @@ def _stage_buckyos_app_root(*, src_root: Path, dst_root: Path, layout: AppLayout
             dst.parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(src, dst)
 
+    common.stage_licenses(src_root, dst_root)
+
 
 def _normalize_tree_modes(root: Path) -> None:
     if not root.exists():
@@ -308,8 +310,8 @@ def _verify_linux_dependencies(
 def _linux_payload_allowlist(layout: AppLayout, *, include_systemd_service: bool) -> tuple[List[str], List[str]]:
     root = "opt/buckyos"
     defaults_root = f"{root}/{BUCKYOS_DEFAULTS_SUBDIR}"
-    allowed_prefixes: List[str] = []
-    allowed_exact = ["opt", root, defaults_root]
+    allowed_prefixes: List[str] = [f"{root}/licenses", f"{root}/share/licenses"]
+    allowed_exact = ["opt", root, defaults_root, f"{root}/share"]
 
     def add_prefix(prefix: str) -> None:
         allowed_prefixes.append(prefix)

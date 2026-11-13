@@ -4,7 +4,7 @@
 **发布日期：** [待补充]  
 **生效日期：** [待补充]  
 **官方网站：** [待补充：BuckyOS 官方链接]  
-**开源仓库/许可证链接：** [待补充]  
+**开源仓库/许可证链接：** 见第 4.1 节及安装目录中的 licenses/。
 **DAO / 治理说明链接：** [待补充]
 
 ## 1. 前言
@@ -82,7 +82,11 @@
 
 ### 4.1 适用许可证优先
 
-本软件的源代码与可分发版本，可能分别适用 GPL、GPL 兼容许可证或其他经本项目明确说明的开源许可证。具体许可范围、条件与义务，以本软件发布时实际附带或明确链接指向的许可证文本为准。
+buckyos-pack-installer 安装工具与 BuckyOSApp 桌面客户端采用 Apache License, Version 2.0（Apache-2.0）。buckyos 仓库中的 BuckyOS 运行时采用 GNU Affero General Public License 第 3 版，仅限该版本（AGPL-3.0-only）。第三方库、工具、素材及其他单独授权的组件继续适用各自的许可证与版权声明，项目许可证不替代这些条款。
+
+运行、研究、复制、修改及再分发软件本体的权利由适用的开源许可证授予，不以接受本协议或在线服务条款为前提。本协议中的限制、审批要求或后续修订不得为这些权利附加条件。单独的服务条款仅适用于相应的可选服务。分发所需的声明、对应源码等义务仍以各组件的许可证为准。
+
+许可证与源码仓库：[安装工具（Apache-2.0）](https://github.com/buckyos/buckyos-pack-installer)、[BuckyOSApp（Apache-2.0）](https://github.com/buckyos/BuckyOSApp)、[BuckyOS 运行时（AGPL-3.0-only）](https://github.com/buckyos/buckyos)。组件声明随安装包保存在安装目录的 licenses/ 下。
 
 ### 4.2 用户享有的基本自由
 
