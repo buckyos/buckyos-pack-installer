@@ -49,6 +49,7 @@ TMP_INSTALL_DIR = RESULT_ROOT_DIR / "macos-pkg"
 MACOS_PKG_PROJECT_DIR = Path(__file__).resolve().parent / "macos_pkg"
 BUCKYOS_DEFAULTS_SUBDIR = ".buckyos_installer_defaults"
 IGNORED_STAGE_NAMES = {".DS_Store", "__pycache__"}
+MACOS_MIN_VERSION = "14.0"
 
 
 def yaml_load_file(path: Path) -> Dict[str, Any]:
@@ -432,6 +433,7 @@ def _write_distribution_xml(
     lines.append('<installer-gui-script minSpecVersion="2">')
     lines.append(f"  <title>{_xml_escape(title)}</title>")
     lines.append('  <options customize="always" />')
+    lines.append(f'  <volume-check><allowed-os-versions><os-version min="{MACOS_MIN_VERSION}" /></allowed-os-versions></volume-check>')
     # Docker availability is checked by buckyos_preinstall, so BuckyOSApp-only
     # installs are not blocked by a global Distribution check.
 
